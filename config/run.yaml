@@ -1,0 +1,12 @@
+# config/run.yaml — optional per-run overrides, no code changes.
+# Resolution order for every LLM call: --model flag / call arg → this file → llm.yaml defaults.model.
+# Leave models empty to require an explicit --model on the command line.
+
+models:
+  # lead:   <any-model-id>
+  # worker: <any-model-id>
+  # classify: <any-model-id>
+  # report: <any-model-id>
+  # default: <any-model-id>     # fallback for roles not listed above
+
+# provider: default             # switch every call to another provider from llm.yaml

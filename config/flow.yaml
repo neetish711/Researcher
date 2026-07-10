@@ -1,0 +1,9 @@
+# config/flow.yaml — agent order + human gates.
+# Reorder agents, drop a gate, or copy this file for a custom flow
+# (e.g. skip discovery and start from an existing map).
+flow:
+  - { agent: discovery,   gate: confirm_problem }
+  - { agent: mapping,     gate: validate_map }
+  - { agent: research,    gate: approve_plan }
+  - { agent: suitability, gate: none }
+human_gates: true          # false = unattended (not recommended)

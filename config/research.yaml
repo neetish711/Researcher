@@ -1,0 +1,46 @@
+# config/research.yaml — every knob that shapes Agent 3's deep loop.
+# Schema + methods documented in RESEARCH_AGENT_SPEC.md §2.
+
+budget:
+  max_wall_clock: 4h            # <n>h | <n>m | <n>s; CLI --budget overrides
+  max_rounds: 6
+  min_rounds: 2
+  max_workers: 4
+  max_tool_calls_per_worker: 40
+  # cost cap comes from config/llm.yaml limits.max_cost_usd_per_run
+
+coverage:                       # loop exits early only when ALL are met
+  min_options_per_category: 3
+  min_findings_per_option: 3
+  require_similarity_on_all: true
+  require_costs_on_all: true
+
+categories:                     # one parallel worker each
+  no_code:   "No-code platforms an ops team can configure without engineers"
+  low_code:  "Low-code platforms needing light scripting/config by a technical user"
+  full_code: "Frameworks/libraries/APIs for a custom engineered build"
+  saas:      "Off-the-shelf SaaS products solving this workflow directly"
+
+queries:
+  angles: [capabilities, integrations, pricing, limits, security, case studies, alternatives, reviews]
+  max_queries_per_round: 12     # per worker
+  results_per_query: 6
+
+sources:
+  reliability:                  # substring match on URL → tier; everything else is low
+    high:   ["docs.", "developer.", "learn.", ".org/docs", "readthedocs"]
+    medium: ["github.com", "stackoverflow.com", "wikipedia.org"]
+  prefer_official_docs: true
+  down_weight_vendor_claims: true
+  denylist: []
+
+similarity:
+  existing_solution_threshold: 75   # index >= this => flagged "already exists"
+
+cost:
+  hourly_rate_usd: 120
+  label_estimates: true
+
+outputs:                        # relative to runs/<id>/
+  html: reports/detailed_analysis.html
+  ppt:  reports/overview.pptx

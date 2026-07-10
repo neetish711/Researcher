@@ -1,0 +1,33 @@
+# config/llm.yaml
+# Configure KEYS only. Models are NOT fixed here.
+# Pass the model per call: CLI --model / function arg / run config.
+# Any call can override both model and provider.
+
+# ── Providers: keys + endpoints only. No models listed. ──
+providers:
+  default:                          # used unless a call overrides it
+    api_key_env: LLM_API_KEY        # your key goes in this env var
+    base_url: https://api.anthropic.com   # any Anthropic or OpenAI-compatible endpoint
+  # Optional extra providers to switch to per call:
+  # openai:     { api_key_env: OPENAI_API_KEY,     base_url: https://api.openai.com/v1 }
+  # openrouter: { api_key_env: OPENROUTER_API_KEY, base_url: https://openrouter.ai/api/v1 }
+  # local:      { api_key_env: LOCAL_API_KEY,      base_url: http://localhost:11434/v1 }
+
+# ── Roles: behavior only (temperature, tokens). NO model pinned. ──
+roles:
+  lead:     { temperature: 0.2, max_tokens: 8000 }
+  worker:   { temperature: 0.3, max_tokens: 4000 }
+  classify: { temperature: 0.0, max_tokens: 1000 }
+  report:   { temperature: 0.5, max_tokens: 16000 }
+
+# ── Defaults: provider + optional fallback model. ──
+defaults:
+  provider: default
+  model: null            # null = model MUST be given at call time; or set one here as a fallback
+  top_p: 0.95
+  timeout_seconds: 120
+  max_retries: 4
+
+limits:
+  max_cost_usd_per_run: 25.0
+  on_limit: checkpoint_and_pause
