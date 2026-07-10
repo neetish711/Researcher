@@ -15,7 +15,9 @@ lives on disk under runs/<id>/ (attach a volume in production to survive deploys
 from __future__ import annotations
 
 import json
+import os
 import threading
+from pathlib import Path
 from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -34,7 +36,8 @@ app = FastAPI(
     version="1.0",
 )
 
-RUNS_DIR = REPO_ROOT / "runs"
+# Serverless hosts (e.g. Vercel) have a read-only bundle — point RUNS_DIR at /tmp there.
+RUNS_DIR = Path(os.environ.get("RUNS_DIR", str(REPO_ROOT / "runs")))
 _threads: Dict[str, threading.Thread] = {}
 _lock = threading.Lock()
 

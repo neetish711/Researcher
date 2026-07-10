@@ -56,9 +56,17 @@ curl -X POST /runs/<id>/approve    # confirm_problem → validate_map → approv
 curl /runs/<id>/report             # interactive HTML report
 ```
 
-Interactive API docs at `/docs`. Deploy: connect the repo on Railway (or `railway up`) and set
-`LLM_API_KEY`. Note: discovery's follow-up interview is skipped in server mode — put
-everything you know in `problem`. `runs/` is ephemeral without a volume.
+Interactive API docs at `/docs`. Note: discovery's follow-up interview is skipped in server
+mode — put everything you know in `problem`.
+
+Deploy targets:
+- **Vercel** — `vercel --prod`; `api/index.py` + `vercel.json` route everything to the
+  FastAPI app. Set `LLM_API_KEY` in project env vars. Serverless caveats: run state lives
+  in `/tmp` (per-instance, ephemeral) and background execution is capped by the function's
+  `maxDuration` (300s) — fine for the API + discovery/mapping gates; long research rounds
+  belong on an always-on host or the CLI.
+- **Railway** (always-on alternative) — `railway up`; `railway.json`/`Procfile` start
+  uvicorn. Attach a volume at `/app/runs` to persist state across deploys.
 
 ## Guarantees (enforced in code)
 
