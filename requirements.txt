@@ -4,3 +4,5 @@ requests>=2.31
 beautifulsoup4>=4.12
 ddgs>=9.0          # free web search (DuckDuckGo); research agent degrades gracefully without it
 python-pptx>=0.6.23  # PPT overview report; skipped with a warning if missing
+fastapi>=0.110     # HTTP server mode (src/server/app.py) — used for cloud deploys
+uvicorn>=0.29

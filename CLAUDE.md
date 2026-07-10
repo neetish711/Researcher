@@ -26,6 +26,9 @@ python -m src.agents.suitability --model <model-id> --input runs/<id>/casefile.j
 # Resume after a gate stop or budget pause
 python -m src.orchestrator.runner --resume runs/<id> --model <model-id>
 
+# HTTP server mode (what Railway runs — see railway.json / Procfile)
+uvicorn src.server.app:app --host 0.0.0.0 --port 8000
+
 # Checks (no test suite yet; smoke = compile + import)
 python -m compileall -q src
 ```
@@ -71,6 +74,15 @@ synthesizes similarity (matched/missing vs the plan's `target_profile`), cost es
 CaseFile is saved every round, so a `BudgetExceeded` (cost cap from `llm.yaml limits`, or
 wall clock via `Deadline`) loses at most one round — the `checkpoint_and_exit` path prints
 the `--resume` command and exits with code 3.
+
+**Server mode reuses the runner's pieces, not a parallel implementation.**
+`src/server/app.py` (FastAPI) steps through the same `flow.yaml` via
+`runner.call_agent`/`gate_satisfied` in a background thread with
+`ctx.interactive=False`; a run halts at `awaiting_gate:<name>` and
+`POST /runs/{id}/approve` sets the corresponding human flag and continues. Per-run
+model/provider/budget live in `runs/<id>/server_params.json` (models still per-call,
+never pinned). If you change gate names or add agents, update both
+`runner.gate_satisfied` and the approve endpoint's flag mapping.
 
 **Cost accounting spans resumed sessions.** `CostTracker` (thread-safe; price-per-Mtok from
 `LLM_COST_PER_MTOK_INPUT/OUTPUT` env vars since no model is pinned) counts the current

@@ -21,7 +21,7 @@ from src.tools.costs import BudgetExceeded
 from src.tools.models import CONFIG_DIR, REPO_ROOT, RunContext, load_yaml
 
 
-def _gate_satisfied(case: CaseFile, gate_name: str) -> bool:
+def gate_satisfied(case: CaseFile, gate_name: str) -> bool:
     if gate_name in (None, "", "none"):
         return True
     if gate_name == "confirm_problem":
@@ -33,7 +33,7 @@ def _gate_satisfied(case: CaseFile, gate_name: str) -> bool:
     raise SystemExit(f"unknown gate {gate_name!r} in flow config")
 
 
-def _call_agent(name: str, case: CaseFile, ctx: RunContext,
+def call_agent(name: str, case: CaseFile, ctx: RunContext,
                 problem: str, budget: Optional[str]) -> CaseFile:
     if name == "discovery":
         return discovery.run(case, ctx, problem=problem)
@@ -66,12 +66,12 @@ def run_flow(flow_path: Path, case: CaseFile, ctx: RunContext,
         print(f"\n════ agent: {name} (gate after: {gate_name}) ════")
         case.next_agent = name
         try:
-            case = _call_agent(name, case, ctx, problem, budget)
+            case = call_agent(name, case, ctx, problem, budget)
         except BudgetExceeded as e:
             checkpoint_and_exit(case, ctx, e, next_agent=name)
         case.save(ctx.run_dir)  # checkpoint after every agent
 
-        if ctx.interactive and not _gate_satisfied(case, gate_name):
+        if ctx.interactive and not gate_satisfied(case, gate_name):
             case.status = f"awaiting_gate:{gate_name}"
             save_and_report(case, ctx)
             print(f"[runner] stopped at gate {gate_name!r} — rerun or "

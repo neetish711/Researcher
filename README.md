@@ -42,6 +42,24 @@ python -m src.orchestrator.runner --resume runs/<id> --model <model-id>
 Outputs land in `runs/<id>/`: `casefile.json` (all state) and `reports/`
 (`detailed_analysis.html`, `overview.pptx`).
 
+## Server mode / deploy (Railway)
+
+`src/server/app.py` wraps the same pipeline in HTTP — the CLI's human gates become API
+approvals. Runs execute in the background and stop at each gate until you approve.
+
+```bash
+uvicorn src.server.app:app --host 0.0.0.0 --port 8000   # local; Railway uses railway.json
+
+curl -X POST /runs -d '{"problem": "…", "model": "<model-id>", "budget": "1h"}'
+curl /runs/<id>                    # status + full casefile; shows which gate it awaits
+curl -X POST /runs/<id>/approve    # confirm_problem → validate_map → approve_plan
+curl /runs/<id>/report             # interactive HTML report
+```
+
+Interactive API docs at `/docs`. Deploy: connect the repo on Railway (or `railway up`) and set
+`LLM_API_KEY`. Note: discovery's follow-up interview is skipped in server mode — put
+everything you know in `problem`. `runs/` is ephemeral without a volume.
+
 ## Guarantees (enforced in code)
 
 - **No claim without a source** — a `Finding` cannot be constructed without a `Source`;
