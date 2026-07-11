@@ -425,7 +425,11 @@ def prompt_put(name: str, body: PromptIn) -> dict:
     path = PROMPTS_DIR / f"{name}.md"
     if not re.fullmatch(r"[a-z_]+", name) or not path.exists():
         raise HTTPException(404, f"no prompt {name!r}")
-    path.write_text(body.content, encoding="utf-8")
+    try:
+        path.write_text(body.content, encoding="utf-8")
+    except OSError as e:
+        raise HTTPException(409, "prompts are read-only on this host (serverless bundle) — "
+                                 f"edit src/prompts/{name}.md in the repo instead ({e})")
     return {"name": name, "saved": True,
             "note": "prompt edits apply to the next agent invocation"}
 
