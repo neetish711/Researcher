@@ -166,20 +166,26 @@ def firecrawl_read(url: str) -> Dict:
 
 
 def tinyfish_extract(url: str, instruction: str = "extract the pricing table") -> Dict:
-    """Agentic structured extraction (experimental — base URL via TINYFISH_BASE_URL)."""
+    """Agentic structured extraction via TinyFish's AgentQL REST API
+    (api.agentql.com/v1/query-data, natural-language prompt → structured JSON).
+    Override the base with TINYFISH_BASE_URL for self-hosted/enterprise endpoints."""
     key = get_key("tinyfish")
     if not key:
-        raise AdapterAuthError("no TinyFish key configured")
-    base = os.environ.get("TINYFISH_BASE_URL", "https://api.tinyfish.ai").rstrip("/")
-    resp = requests.post(f"{base}/v1/extract",
-                         headers={"Authorization": f"Bearer {key}",
-                                  "content-type": "application/json"},
-                         json={"url": url, "instruction": instruction}, timeout=90)
+        raise AdapterAuthError("no TinyFish/AgentQL key configured")
+    base = os.environ.get("TINYFISH_BASE_URL", "https://api.agentql.com").rstrip("/")
+    resp = requests.post(f"{base}/v1/query-data",
+                         headers={"X-API-Key": key, "content-type": "application/json"},
+                         json={"url": url, "prompt": instruction}, timeout=90)
     if resp.status_code in (401, 403):
         raise AdapterAuthError(f"HTTP {resp.status_code}: {resp.text[:200]}")
     if resp.status_code >= 400:
         raise AdapterError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-    return {"text": resp.text[:20000], "units": 1}
+    import json as _json
+    body = resp.json()
+    data = body.get("data", body)
+    if not data:
+        raise AdapterError("extraction returned no data")
+    return {"text": _json.dumps(data, indent=1)[:20000], "units": 1}
 
 
 def builtin_read(url: str) -> Dict:

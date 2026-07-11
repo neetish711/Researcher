@@ -51,17 +51,17 @@ providers:
     pricing_url: https://jina.ai/reader
 
   tinyfish:
-    name: TinyFish
+    name: TinyFish (AgentQL)
     key_env: TINYFISH_API_KEY
-    base_url_env: TINYFISH_BASE_URL   # agentic extraction API; base URL configurable
+    base_url_env: TINYFISH_BASE_URL   # default https://api.agentql.com (v1/query-data)
     role: "Agentic structured extraction (pricing tables) — saas worker only"
-    monthly_quota: null
+    monthly_quota: null               # AgentQL free tier — verify on the pricing page
     assumed_quota: 50
     unit: request
     rate_limit: { rps: 1, rpm: 20 }
     use_when: structured_extraction_needed
     reliability: secondary
-    pricing_url: https://tinyfish.ai
+    pricing_url: https://www.agentql.com/pricing
 
   algolia_hn:
     name: Hacker News (Algolia)
