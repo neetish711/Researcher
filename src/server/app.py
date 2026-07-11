@@ -62,6 +62,20 @@ _OPEN_PATHS = {"/health", "/", "/index.html", "/favicon.ico"}
 
 
 @app.middleware("http")
+async def _cache_headers(request, call_next):
+    """SPA cache discipline: the HTML shell must never be cached (it names the
+    current bundle hash — a cached copy 404s after the next deploy purges old
+    assets), while the content-hashed /assets/* files are immutable forever."""
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif path in ("/", "/index.html"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
+@app.middleware("http")
 async def _auth(request, call_next):
     if CONSOLE_TOKEN:
         path = request.url.path
