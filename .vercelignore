@@ -3,3 +3,6 @@ reports/
 __pycache__/
 .env
 .git/
+ui/node_modules/
+ui/src/
+data/

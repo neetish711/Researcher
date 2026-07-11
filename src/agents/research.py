@@ -26,8 +26,8 @@ from src.state.casefile import (CaseFile, CostEstimate, Finding, ResearchPlan,
 from src.tools.costs import BudgetExceeded, Deadline
 from src.tools.models import (CONFIG_DIR, RunContext, llm_json, load_prompt, load_yaml)
 from src.tools.reports import render_html, render_ppt
-from src.tools.search import (check_url, fetch_page, is_denied, rate_reliability,
-                              web_search)
+from src.tools.search import check_url, fetch_page, is_denied, rate_reliability
+from src.server.sources import TIER_TO_RELIABILITY, multi_search
 
 PAGE_CHARS_PER_EXTRACTION = 6000
 PAGES_PER_EXTRACTION_CALL = 4
@@ -47,7 +47,7 @@ def _make_plan(case: CaseFile, ctx: RunContext, cfg: dict) -> ResearchPlan:
         "data_inventory": [d.model_dump() for d in case.data_inventory],
     }, indent=2)
     data = llm_json(prompt=f"Plan the research for:\n{payload}", role="lead",
-                    system=system, ctx=ctx)
+                    system=system, ctx=ctx, purpose="research plan")
     return ResearchPlan(
         target_profile=data.get("target_profile", ""),
         capabilities=data.get("capabilities", []),
@@ -87,7 +87,7 @@ def _generate_queries(category: str, description: str, plan: ResearchPlan,
         "max_queries": q.get("max_queries_per_round", 12),
     }, indent=2)
     data = llm_json(
-        prompt=prompt, role="worker", ctx=ctx,
+        prompt=prompt, role="worker", ctx=ctx, purpose=f"queries:{category}",
         system=("Cross each capability with each angle and emit concrete web search queries "
                 "for THIS category only. Prioritize official documentation and pricing pages. "
                 'If focus gaps are given, target those first. Output strict JSON: {"queries": ["..."]}'))
@@ -95,8 +95,9 @@ def _generate_queries(category: str, description: str, plan: ResearchPlan,
     return queries[: q.get("max_queries_per_round", 12)]
 
 
-def _gather_pages(queries: List[str], cfg: dict, budget_left: List[int]) -> List[dict]:
-    """Search then fetch full pages, best-first by reliability tier."""
+def _gather_pages(queries: List[str], cfg: dict, budget_left: List[int],
+                  ctx: RunContext) -> List[dict]:
+    """Search all registered sources, then fetch full pages, best-first by reliability."""
     q = cfg.get("queries") or {}
     sources_cfg = cfg.get("sources") or {}
     hits: Dict[str, dict] = {}
@@ -104,10 +105,15 @@ def _gather_pages(queries: List[str], cfg: dict, budget_left: List[int]) -> List
         if budget_left[0] <= 0:
             break
         budget_left[0] -= 1  # a search is a tool call
-        for h in web_search(query, max_results=q.get("results_per_query", 6)):
+        for h in multi_search(query, n_per_source=q.get("results_per_query", 6),
+                              only=ctx.sources, events=ctx.events):
             url = h["url"]
             if url not in hits and not is_denied(url, sources_cfg):
-                h["reliability"] = rate_reliability(url, sources_cfg)
+                # a source's registry tier is a floor; official-docs URLs still rank high
+                by_url = rate_reliability(url, sources_cfg)
+                by_tier = TIER_TO_RELIABILITY.get(h.get("tier", ""), "low")
+                order = {"high": 0, "medium": 1, "low": 2}
+                h["reliability"] = by_url if order[by_url] <= order[by_tier] else by_tier
                 hits[url] = h
     ranked = sorted(hits.values(),
                     key=lambda h: {"high": 0, "medium": 1, "low": 2}[h["reliability"]])
@@ -117,9 +123,26 @@ def _gather_pages(queries: List[str], cfg: dict, budget_left: List[int]) -> List
             break
         budget_left[0] -= 1  # a fetch is a tool call
         text = fetch_page(h["url"])
+        ctx.emit("page_fetch", agent="research", url=h["url"],
+                 status="ok" if text else "error", chars=len(text),
+                 error="" if text else "empty or unreachable")
         if text:
             pages.append({"url": h["url"], "title": h["title"],
                           "reliability": h["reliability"], "text": text})
+    return pages
+
+
+def _uploaded_docs(ctx: RunContext) -> List[dict]:
+    """User-staged internal documents become high-reliability internal:// pages."""
+    updir = ctx.run_dir / "uploads"
+    pages = []
+    if updir.exists():
+        for f in sorted(updir.glob("*.extracted.txt")):
+            name = f.name.replace(".extracted.txt", "")
+            text = f.read_text(encoding="utf-8", errors="replace")
+            ctx.emit("doc_read", agent="research", url=f"internal://{name}", chars=len(text))
+            pages.append({"url": f"internal://{name}", "title": name,
+                          "reliability": "high", "text": text})
     return pages
 
 
@@ -137,28 +160,38 @@ def _extract(category: str, plan: ResearchPlan, pages: List[dict],
             "pages": [{"url": p["url"], "title": p["title"],
                        "text": p["text"][:PAGE_CHARS_PER_EXTRACTION]} for p in batch],
         }, indent=2)
-        data = llm_json(prompt=body, role="worker", system=system, ctx=ctx)
+        data = llm_json(prompt=body, role="worker", system=system, ctx=ctx,
+                        purpose=f"extract:{category}")
         for key in merged:
             merged[key].extend(data.get(key) or [])
     return merged
 
 
 def _worker_round(category: str, description: str, plan: ResearchPlan, cfg: dict,
-                  focus: List[str], ctx: RunContext) -> Tuple[str, dict]:
+                  focus: List[str], ctx: RunContext, round_no: int) -> Tuple[str, dict]:
+    ctx.emit("worker_start", agent="research", worker=category, round=round_no)
     budget_left = [int((cfg.get("budget") or {}).get("max_tool_calls_per_worker", 40))]
     queries = _generate_queries(category, description, plan, cfg, focus, ctx)
-    pages = _gather_pages(queries, cfg, budget_left)
+    pages = _gather_pages(queries, cfg, budget_left, ctx)
+    if round_no == 1:
+        pages = _uploaded_docs(ctx) + pages  # staged internal docs feed round 1
     print(f"  [worker:{category}] {len(queries)} queries → {len(pages)} pages read "
           f"({budget_left[0]} tool calls left)")
     if not pages:
+        ctx.emit("worker_end", agent="research", worker=category, round=round_no,
+                 status="error", error=f"no reachable sources found for {category}")
         return category, {"options": [], "findings": [],
                           "open_questions": [f"no reachable sources found for {category}"]}
-    return category, _extract(category, plan, pages, ctx)
+    result = _extract(category, plan, pages, ctx)
+    ctx.emit("worker_end", agent="research", worker=category, round=round_no,
+             options=len(result.get("options", [])), findings=len(result.get("findings", [])))
+    return category, result
 
 
 # ── merge worker output into the casefile (main thread only) ────────────────
 
-def _merge(case: CaseFile, category: str, result: dict, cfg: dict) -> None:
+def _merge(case: CaseFile, category: str, result: dict, cfg: dict,
+           ctx: RunContext) -> None:
     sources_cfg = cfg.get("sources") or {}
     existing = {o.name.lower(): o for o in case.tool_landscape.get(category, [])}
     for raw in result.get("options", []):
@@ -201,6 +234,8 @@ def _merge(case: CaseFile, category: str, result: dict, cfg: dict) -> None:
         except ValueError:
             continue
         case.add_finding(finding)
+        ctx.emit("finding_created", agent="research", finding_id=finding.id,
+                 claim=finding.claim[:300], kind=finding.kind, category=category, url=url)
         seen.add((claim.lower(), url))
 
     for q in result.get("open_questions", []):
@@ -227,7 +262,8 @@ def _synthesize(case: CaseFile, plan: ResearchPlan, cfg: dict,
                       "category": f.category, "vendor_claim": f.vendor_claim,
                       "url": f.source.url} for f in case.findings],
     }, indent=2)
-    data = llm_json(prompt=payload, role="lead", system=system, ctx=ctx)
+    data = llm_json(prompt=payload, role="lead", system=system, ctx=ctx,
+                    purpose="synthesis: similarity + costs + scores")
 
     by_key = {(o.category, o.name.lower()): o
               for opts in case.tool_landscape.values() for o in opts}
@@ -287,11 +323,17 @@ def _coverage_met(case: CaseFile, cfg: dict) -> bool:
 
 # ── 9. citation verification ────────────────────────────────────────────────
 
-def _verify_citations(case: CaseFile) -> None:
+def _verify_citations(case: CaseFile, ctx: RunContext) -> None:
     print(f"[verify] checking {len(case.findings)} citations for reachability…")
+
+    def _check(f: Finding) -> bool:
+        if f.source.url.startswith("internal://"):
+            return True  # user-staged internal doc — reachable by construction
+        return check_url(f.source.url)
+
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = dict(zip([f.id for f in case.findings],
-                           pool.map(lambda f: check_url(f.source.url), case.findings)))
+                           pool.map(_check, case.findings)))
     cited_ids = {fid for opts in case.tool_landscape.values()
                  for o in opts for fid in o.finding_ids}
     kept: List[Finding] = []
@@ -299,15 +341,20 @@ def _verify_citations(case: CaseFile) -> None:
     for f in case.findings:
         if results.get(f.id, False):
             f.source.verified = True
+            ctx.emit("citation_verified", agent="research", finding_id=f.id, url=f.source.url)
             kept.append(f)
         elif f.id in cited_ids or f.option:
             f.source.verified = False
             f.kind = "assumption"          # demote: unreachable evidence is not a fact
             f.confidence = min(f.confidence, 0.3)
             demoted += 1
+            ctx.emit("citation_rejected", agent="research", finding_id=f.id, url=f.source.url,
+                     action="demoted to assumption", reason="source unreachable")
             kept.append(f)
         else:
             dropped += 1                   # nothing cites it — it does not survive
+            ctx.emit("citation_rejected", agent="research", finding_id=f.id, url=f.source.url,
+                     action="dropped", reason="source unreachable and nothing cites it")
     case.findings = kept
     valid = {f.id for f in case.findings}
     for opts in case.tool_landscape.values():
@@ -342,6 +389,10 @@ def run(case: CaseFile, ctx: RunContext, budget: Optional[str] = None) -> CaseFi
         else:
             case.status = "awaiting_gate:approve_plan"
             case.next_agent = "research"
+            ctx.emit("gate_waiting", agent="research", gate="approve_plan",
+                     needs_approval={"target_profile": case.research_plan.target_profile,
+                                     "capabilities": case.research_plan.capabilities,
+                                     "questions": case.research_plan.questions})
             print("[research] plan NOT approved — no worker will spend a tool call.")
             return case
     plan = case.research_plan
@@ -360,12 +411,12 @@ def run(case: CaseFile, ctx: RunContext, budget: Optional[str] = None) -> CaseFi
 
         budget_err: Optional[BudgetExceeded] = None
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_worker_round, cat, desc, plan, cfg, gaps, ctx): cat
+            futures = {pool.submit(_worker_round, cat, desc, plan, cfg, gaps, ctx, rnd): cat
                        for cat, desc in categories.items()}
             for fut in as_completed(futures):
                 try:
                     category, result = fut.result()
-                    _merge(case, category, result, cfg)
+                    _merge(case, category, result, cfg, ctx)
                 except BudgetExceeded as e:
                     budget_err = e
         if budget_err:
@@ -375,9 +426,15 @@ def run(case: CaseFile, ctx: RunContext, budget: Optional[str] = None) -> CaseFi
         gaps = _synthesize(case, plan, cfg, ctx)
         case.research_rounds_done = rnd
         case.save(ctx.run_dir)  # checkpoint every round
+        ctx.emit("checkpoint_saved", agent="research", round=rnd)
 
         total_findings = len(case.findings)
         total_options = sum(len(v) for v in case.tool_landscape.values())
+        ctx.emit("round_complete", agent="research", round=rnd, of=max_rounds,
+                 options=total_options, findings=total_findings, gaps=len(gaps),
+                 spent_usd=round(ctx.tracker.spent_usd, 4),
+                 wall_clock_left_s=int(deadline.remaining()),
+                 wall_clock_budget_s=int(deadline.seconds))
         print(f"[research] round {rnd} done: {total_options} options, "
               f"{total_findings} findings, {len(gaps)} coverage gaps")
 
@@ -388,7 +445,7 @@ def run(case: CaseFile, ctx: RunContext, budget: Optional[str] = None) -> CaseFi
             print("[research] wall clock exhausted — exiting with what we have")
             break
 
-    _verify_citations(case)
+    _verify_citations(case, ctx)
 
     out = cfg.get("outputs") or {}
     reports_dir = ctx.run_dir

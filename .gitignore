@@ -7,3 +7,5 @@ reports/
 venv/
 
 .vercel
+ui/node_modules/
+data/
