@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 from src.orchestrator.runner import call_agent, gate_satisfied
@@ -134,8 +134,25 @@ def _summary(case: CaseFile) -> dict:
     }
 
 
-@app.get("/")
-def root() -> dict:
+_DASHBOARD = (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
+
+# name exposed to the UI -> (relative path in the run dir, media type, download filename)
+_RUN_FILES = {
+    "casefile.json": ("casefile.json", "application/json", "casefile.json"),
+    "report.html": ("reports/detailed_analysis.html", "text/html", "detailed_analysis.html"),
+    "overview.pptx": ("reports/overview.pptx",
+                      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                      "overview.pptx"),
+}
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard() -> str:
+    return _DASHBOARD
+
+
+@app.get("/api")
+def api_index() -> dict:
     return {
         "service": "Opportunity-to-Solution Copilot",
         "docs": "/docs",
@@ -226,3 +243,27 @@ def report(run_id: str) -> FileResponse:
     if not path.exists():
         raise HTTPException(404, "no report yet — research has not completed")
     return FileResponse(str(path), media_type="text/html")
+
+
+@app.get("/runs/{run_id}/files")
+def list_files(run_id: str) -> dict:
+    _load_case(run_id)
+    files = []
+    for name, (rel, _media, _dl) in _RUN_FILES.items():
+        path = RUNS_DIR / run_id / rel
+        files.append({"name": name, "available": path.exists(),
+                      "size": path.stat().st_size if path.exists() else 0,
+                      "url": f"/runs/{run_id}/files/{name}"})
+    return {"files": files}
+
+
+@app.get("/runs/{run_id}/files/{name}")
+def download_file(run_id: str, name: str) -> FileResponse:
+    _load_case(run_id)
+    if name not in _RUN_FILES:  # whitelist — never serve arbitrary paths
+        raise HTTPException(404, f"unknown file {name!r} (have: {list(_RUN_FILES)})")
+    rel, media, download_name = _RUN_FILES[name]
+    path = RUNS_DIR / run_id / rel
+    if not path.exists():
+        raise HTTPException(404, f"{name} not generated yet for this run")
+    return FileResponse(str(path), media_type=media, filename=download_name)
