@@ -25,7 +25,7 @@ from src.state.casefile import (CaseFile, CostEstimate, Finding, ResearchPlan,
                                 SimilarityResult, Source, ToolOption)
 from src.tools.costs import BudgetExceeded, Deadline
 from src.tools.models import (CONFIG_DIR, RunContext, llm_json, load_prompt, load_yaml)
-from src.tools.reports import render_html, render_ppt
+from src.tools.reports import render_html, render_one_pager, render_ppt
 from src.tools.search import check_url, is_denied, rate_reliability
 from src.server.router import RouterSession
 from src.server.sources import TIER_TO_RELIABILITY, list_sources, multi_search
@@ -46,6 +46,7 @@ def _make_plan(case: CaseFile, ctx: RunContext, cfg: dict) -> ResearchPlan:
         "problem_statement": case.problem_statement,
         "future_workflow": [s.model_dump() for s in case.future_workflow],
         "data_inventory": [d.model_dump() for d in case.data_inventory],
+        "human_feedback_on_previous_plan": case.gate_feedback.get("approve_plan", []),
     }, indent=2)
     data = llm_json(prompt=f"Plan the research for:\n{payload}", role="lead",
                     system=system, ctx=ctx, purpose="research plan")
@@ -508,6 +509,7 @@ def run(case: CaseFile, ctx: RunContext, budget: Optional[str] = None) -> CaseFi
     reports_dir = ctx.run_dir
     html = render_html(case, reports_dir / out.get("html", "reports/detailed_analysis.html"))
     print(f"[reports] {html}")
+    render_one_pager(case, reports_dir / "reports" / "one_pager.html")
     ppt = render_ppt(case, reports_dir / out.get("ppt", "reports/overview.pptx"))
     if ppt:
         print(f"[reports] {ppt}")

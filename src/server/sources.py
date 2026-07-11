@@ -28,48 +28,10 @@ _lock = threading.Lock()
 TIER_TO_RELIABILITY = {"primary": "high", "secondary": "medium",
                        "vendor": "low", "community": "low"}
 
-BUILTINS: List[Dict] = [
-    {"id": "ddg_web", "name": "DuckDuckGo Web", "builtin": True, "tier": "secondary",
-     "weight": 1.0, "enabled": True, "free_tier": "unlimited, unauthenticated",
-     "auth": {"type": "none"}, "special": "ddg",
-     "description": "General web search (ddgs package with HTML fallback)"},
-    {"id": "github_repos", "name": "GitHub Repositories", "builtin": True, "tier": "primary",
-     "weight": 1.0, "enabled": True, "free_tier": "10 req/min unauthenticated",
-     "auth": {"type": "none"},
-     "request": {"url": "https://api.github.com/search/repositories?q={query}&per_page={n}"},
-     "mapping": {"items": "items", "title": "full_name", "url": "html_url",
-                 "snippet": "description", "date": "updated_at"},
-     "description": "Open-source tools and frameworks"},
-    {"id": "stackoverflow", "name": "Stack Overflow", "builtin": True, "tier": "community",
-     "weight": 0.7, "enabled": True, "free_tier": "300 req/day unauthenticated",
-     "auth": {"type": "none"},
-     "request": {"url": "https://api.stackexchange.com/2.3/search/advanced"
-                        "?q={query}&site=stackoverflow&pagesize={n}&order=desc&sort=relevance"},
-     "mapping": {"items": "items", "title": "title", "url": "link", "snippet": "",
-                 "date": "creation_date"},
-     "description": "Practitioner problems and integration pain points"},
-    {"id": "hackernews", "name": "Hacker News (Algolia)", "builtin": True, "tier": "community",
-     "weight": 0.6, "enabled": True, "free_tier": "unlimited, unauthenticated",
-     "auth": {"type": "none"},
-     "request": {"url": "https://hn.algolia.com/api/v1/search?query={query}&hitsPerPage={n}"},
-     "mapping": {"items": "hits", "title": "title", "url": "url",
-                 "snippet": "story_text", "date": "created_at"},
-     "description": "Launches, reviews, war stories"},
-    {"id": "npm", "name": "npm registry", "builtin": True, "tier": "primary",
-     "weight": 0.8, "enabled": False, "free_tier": "unlimited, unauthenticated",
-     "auth": {"type": "none"},
-     "request": {"url": "https://registry.npmjs.org/-/v1/search?text={query}&size={n}"},
-     "mapping": {"items": "objects", "title": "package.name", "url": "package.links.npm",
-                 "snippet": "package.description", "date": "package.date"},
-     "description": "JS ecosystem packages (enable for full-code research)"},
-    {"id": "reddit", "name": "Reddit search", "builtin": True, "tier": "community",
-     "weight": 0.5, "enabled": False, "free_tier": "unauthenticated, strict rate limits",
-     "auth": {"type": "none"},
-     "request": {"url": "https://www.reddit.com/search.json?q={query}&limit={n}"},
-     "mapping": {"items": "data.children", "title": "data.title",
-                 "url": "data.url", "snippet": "data.selftext", "date": "data.created_utc"},
-     "description": "User sentiment; disabled by default (noisy)"},
-]
+# The former built-in list was superseded by the quota-guarded adapter/router stack
+# (src/server/adapters.py + router.py) — one registry, not two. This module now
+# manages USER-REGISTERED custom HTTP APIs only; they ride along with every worker.
+BUILTINS: List[Dict] = []
 
 DEFAULTS = {"rate_limit_per_min": 30, "timeout_s": 20}
 

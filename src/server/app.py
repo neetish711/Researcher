@@ -14,9 +14,18 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# Windows consoles default to cp1252: an error message containing e.g. "→" would
+# crash the printing thread BEFORE the run's error state is saved. Replace, never die.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -44,6 +53,27 @@ RUNS_DIR = Path(os.environ.get("RUNS_DIR", str(REPO_ROOT / "runs")))
 _threads: Dict[str, threading.Thread] = {}
 _lock = threading.Lock()
 _model_cache: Dict[str, List[str]] = {}
+
+# ── auth: set CONSOLE_TOKEN to require it on every API call. Static assets and
+# /health stay open; file/report GETs also accept ?token= (browser downloads
+# can't send headers). Without CONSOLE_TOKEN the console is open (local dev).
+CONSOLE_TOKEN = os.environ.get("CONSOLE_TOKEN", "")
+_OPEN_PATHS = {"/health", "/", "/index.html", "/favicon.ico"}
+
+
+@app.middleware("http")
+async def _auth(request, call_next):
+    if CONSOLE_TOKEN:
+        path = request.url.path
+        if path not in _OPEN_PATHS and not path.startswith("/assets"):
+            supplied = (request.headers.get("x-console-token")
+                        or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+                        or request.query_params.get("token", ""))
+            if supplied != CONSOLE_TOKEN:
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"detail": "unauthorized — supply the console token"},
+                                    status_code=401)
+    return await call_next(request)
 
 ROLES = ["lead", "worker", "classify", "report"]
 
@@ -116,7 +146,13 @@ def _load_case(run_id: str) -> CaseFile:
     path = RUNS_DIR / run_id / "casefile.json"
     if not path.exists():
         raise HTTPException(404, f"run {run_id!r} not found")
-    return CaseFile.load(path)
+    for attempt in range(3):  # saves are atomic; retries cover exotic filesystems
+        try:
+            return CaseFile.load(path)
+        except (json.JSONDecodeError, OSError):
+            import time
+            time.sleep(0.05 * (attempt + 1))
+    raise HTTPException(503, f"run {run_id!r} state is briefly unreadable — retry")
 
 
 def _make_ctx(run_id: str, params: dict) -> RunContext:
@@ -136,7 +172,9 @@ def _gate_payload(case: CaseFile, gate: str) -> dict:
         return {"problem_statement": case.problem_statement,
                 "stated_vs_real": case.stated_vs_real,
                 "captured": [c.model_dump() for c in case.captured],
-                "data_inventory": [d.model_dump() for d in case.data_inventory]}
+                "data_inventory": [d.model_dump() for d in case.data_inventory],
+                "open_interview_questions": case.open_interview_questions,
+                "interview_log": case.interview_log}
     if gate == "validate_map":
         return {"current_workflow": [s.model_dump() for s in case.current_workflow],
                 "future_workflow": [s.model_dump() for s in case.future_workflow]}
@@ -218,7 +256,10 @@ def _kick(run_id: str) -> None:
 def _summary(case: CaseFile) -> dict:
     gate = case.status.split(":", 1)[1] if case.status.startswith("awaiting_gate:") else None
     d = {
-        "run_id": case.run_id, "status": case.status, "awaiting_gate": gate,
+        "run_id": case.run_id, "title": case.title, "status": case.status, "awaiting_gate": gate,
+        "open_questions_count": len(case.open_interview_questions),
+        "decision": case.decision.action if case.decision else None,
+        "recommended_option": case.decision.recommended_option if case.decision else None,
         "next_agent": case.next_agent, "findings": len(case.findings),
         "options": sum(len(v) for v in case.tool_landscape.values()),
         "rounds_done": case.research_rounds_done,
@@ -239,6 +280,7 @@ _KEY_MSG = "That looks like an API key, not a model id — add keys under Settin
 
 class StartRun(BaseModel):
     problem: str
+    title: str = ""
     provider: Optional[str] = None
     model: Optional[str] = None                       # run-wide default model
     models: Optional[Dict[str, str]] = None           # per-role: lead/worker/classify/report
@@ -281,6 +323,27 @@ class RetryIn(BaseModel):
 
 class RejectIn(BaseModel):
     reason: str = ""
+    by: str = ""
+
+
+class ApproveIn(BaseModel):
+    by: str = ""
+
+
+class AnswersIn(BaseModel):
+    answers: List[Dict[str, str]]       # [{question, answer}]
+
+
+class ReviseIn(BaseModel):
+    feedback: str
+    by: str = ""
+
+
+class OutcomeIn(BaseModel):
+    adoption_pct: Optional[float] = None
+    hours_saved_per_month: Optional[float] = None
+    notes: str = ""
+    recorded_by: str = ""
 
 
 class SourceTest(BaseModel):
@@ -479,7 +542,7 @@ def dryrun(body: DryRun) -> dict:
 def start_run(body: StartRun) -> dict:
     if not body.problem.strip():
         raise HTTPException(422, "problem must be non-empty")
-    case = CaseFile()
+    case = CaseFile(title=body.title.strip()[:120])
     run_dir = RUNS_DIR / case.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     _save_params(case.run_id, body.model_dump())
@@ -517,13 +580,14 @@ def get_run(run_id: str) -> dict:
 
 
 @app.post("/runs/{run_id}/approve")
-def approve(run_id: str) -> dict:
+def approve(run_id: str, body: Optional[ApproveIn] = None) -> dict:
     case = _load_case(run_id)
     if not case.status.startswith("awaiting_gate:"):
         raise HTTPException(409, f"run is not waiting at a gate (status: {case.status})")
     gate = case.status.split(":", 1)[1]
     if gate == "confirm_problem":
         case.problem_confirmed_by_human = True
+        case.open_interview_questions = []   # approving = accept remaining gaps as assumptions
     elif gate == "validate_map":
         case.map_validated_by_human = True
     elif gate == "approve_plan":
@@ -534,7 +598,8 @@ def approve(run_id: str) -> dict:
         raise HTTPException(409, f"unknown gate {gate!r}")
     case.status = "in_progress"
     case.save(RUNS_DIR / run_id)
-    EventLog(RUNS_DIR / run_id).emit("gate_approved", agent="human", gate=gate)
+    EventLog(RUNS_DIR / run_id).emit("gate_approved", agent="human", gate=gate,
+                                     by=(body.by if body else "") or "unnamed operator")
     _kick(run_id)
     return {"approved": gate, "status_url": f"/runs/{run_id}"}
 
@@ -548,8 +613,82 @@ def reject(run_id: str, body: RejectIn) -> dict:
     case.status = f"rejected:{gate}"
     case.save(RUNS_DIR / run_id)
     EventLog(RUNS_DIR / run_id).emit("gate_rejected", agent="human", gate=gate,
-                                     reason=body.reason)
+                                     reason=body.reason, by=body.by or "unnamed operator")
     return {"rejected": gate}
+
+
+_GATE_OWNER = {"confirm_problem": "discovery", "validate_map": "mapping",
+               "approve_plan": "research"}
+
+
+@app.post("/runs/{run_id}/answers")
+def submit_answers(run_id: str, body: AnswersIn) -> dict:
+    """Answer the discovery interview from the UI — the consultative loop, over HTTP.
+    Discovery re-runs with the fuller log and either asks sharper follow-ups or
+    completes coverage and returns to the confirm gate."""
+    case = _load_case(run_id)
+    if case.status.startswith("running"):
+        raise HTTPException(409, "run is executing — wait for it to pause")
+    if case.problem_confirmed_by_human:
+        raise HTTPException(409, "problem already confirmed — use /revise to reopen it")
+    answered = [{"question": a.get("question", "").strip(), "answer": a.get("answer", "").strip()}
+                for a in body.answers if a.get("question", "").strip()]
+    if not answered:
+        raise HTTPException(422, "no answers supplied")
+    case.interview_log.extend(answered)
+    case.open_interview_questions = []
+    case.status = "in_progress"
+    case.next_agent = "discovery"        # re-run the interview with the fuller log
+    case.save(RUNS_DIR / run_id)
+    EventLog(RUNS_DIR / run_id).emit("interview_answers", agent="human",
+                                     answered=len(answered))
+    _kick(run_id)
+    return {"recorded": len(answered), "status_url": f"/runs/{run_id}"}
+
+
+@app.post("/runs/{run_id}/revise")
+def revise(run_id: str, body: ReviseIn) -> dict:
+    """Reject-with-guidance: feed feedback to the gate's owning agent and regenerate,
+    instead of killing the run."""
+    case = _load_case(run_id)
+    if not case.status.startswith("awaiting_gate:"):
+        raise HTTPException(409, f"run is not waiting at a gate (status: {case.status})")
+    if not body.feedback.strip():
+        raise HTTPException(422, "feedback must be non-empty")
+    gate = case.status.split(":", 1)[1]
+    owner = _GATE_OWNER.get(gate)
+    if owner is None:
+        raise HTTPException(409, f"unknown gate {gate!r}")
+    case.gate_feedback.setdefault(gate, []).append(body.feedback.strip())
+    if gate == "approve_plan":
+        case.research_plan = None        # force a fresh plan incorporating the feedback
+    if gate == "confirm_problem":
+        case.open_interview_questions = []
+    case.status = "in_progress"
+    case.next_agent = owner
+    case.save(RUNS_DIR / run_id)
+    EventLog(RUNS_DIR / run_id).emit("gate_revision", agent="human", gate=gate,
+                                     feedback=body.feedback, by=body.by or "unnamed operator")
+    _kick(run_id)
+    return {"revising": owner, "status_url": f"/runs/{run_id}"}
+
+
+@app.post("/runs/{run_id}/outcomes", status_code=201)
+def record_outcome(run_id: str, body: OutcomeIn) -> dict:
+    """Post-decision tracking: log actuals against the ROI estimate."""
+    from src.state.casefile import OutcomeEntry
+    case = _load_case(run_id)
+    entry = OutcomeEntry(adoption_pct=body.adoption_pct,
+                         hours_saved_per_month=body.hours_saved_per_month,
+                         notes=body.notes, recorded_by=body.recorded_by or "unnamed operator")
+    case.outcomes.append(entry)
+    case.save(RUNS_DIR / run_id)
+    EventLog(RUNS_DIR / run_id).emit("outcome_recorded", agent="human",
+                                     **entry.model_dump())
+    estimate = case.decision.roi.hours_saved_per_month if case.decision else None
+    return {"recorded": entry.model_dump(),
+            "estimate_hours_saved_per_month": estimate,
+            "total_entries": len(case.outcomes)}
 
 
 @app.post("/runs/{run_id}/resume")
@@ -763,6 +902,7 @@ def snapshot_get(run_id: str, agent: str) -> dict:
 
 _RUN_FILES = {
     "casefile.json": ("casefile.json", "application/json", "casefile.json"),
+    "one_pager.html": ("reports/one_pager.html", "text/html", "decision_brief.html"),
     "report.html": ("reports/detailed_analysis.html", "text/html", "detailed_analysis.html"),
     "overview.pptx": ("reports/overview.pptx",
                       "application/vnd.openxmlformats-officedocument.presentationml.presentation",

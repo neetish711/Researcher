@@ -152,8 +152,57 @@ class Suitability(BaseModel):
         return v
 
 
+DECISION_ACTIONS = ["build", "buy", "pilot", "modify process", "reject"]
+
+
+class PilotPlan(BaseModel):
+    scope: str = ""
+    duration_weeks: int = 0
+    success_criteria: List[str] = Field(default_factory=list)
+    edge_cases_to_test: List[str] = Field(default_factory=list)
+    approvals_needed: List[str] = Field(default_factory=list)
+
+
+class ROIEstimate(BaseModel):
+    """Always kind=estimate: method + assumptions shown next to every figure."""
+    hours_saved_per_month: float = 0.0
+    monthly_value_usd: float = 0.0
+    implementation_cost_usd_low: float = 0.0
+    implementation_cost_usd_high: float = 0.0
+    payback_months_low: float = 0.0
+    payback_months_high: float = 0.0
+    assumptions: List[str] = Field(default_factory=list)
+
+
+class Decision(BaseModel):
+    """The executive answer: what to DO about the idea (Agent 5, evidence-bound)."""
+    action: str                        # build | buy | pilot | modify process | reject
+    recommended_option: Optional[str] = None   # tool name when action is buy/pilot
+    rationale: str = ""
+    pilot_plan: Optional[PilotPlan] = None
+    roi: ROIEstimate = Field(default_factory=ROIEstimate)
+    cited_finding_ids: List[str] = Field(default_factory=list)
+
+    @field_validator("action")
+    @classmethod
+    def _action_allowed(cls, v: str) -> str:
+        if v not in DECISION_ACTIONS:
+            raise ValueError(f"action must be one of {DECISION_ACTIONS}, got {v!r}")
+        return v
+
+
+class OutcomeEntry(BaseModel):
+    """Post-decision tracking: actuals logged against the ROI estimate."""
+    date: str = Field(default_factory=_now)
+    adoption_pct: Optional[float] = None
+    hours_saved_per_month: Optional[float] = None
+    notes: str = ""
+    recorded_by: str = ""
+
+
 class CaseFile(BaseModel):
     run_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
+    title: str = ""                 # human name for the idea (portfolio display)
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)
     status: str = "in_progress"     # in_progress | awaiting_gate:<name> | paused_budget | complete
@@ -165,6 +214,9 @@ class CaseFile(BaseModel):
     captured: List[CapturedItem] = Field(default_factory=list)
     data_inventory: List[DataInventoryItem] = Field(default_factory=list)
     problem_confirmed_by_human: bool = False
+    open_interview_questions: List[str] = Field(default_factory=list)  # answerable via API
+    interview_log: List[Dict[str, str]] = Field(default_factory=list)  # [{question, answer}]
+    gate_feedback: Dict[str, List[str]] = Field(default_factory=dict)  # gate -> human revision notes
 
     # Agent 2
     current_workflow: List[WorkflowStep] = Field(default_factory=list)
@@ -180,6 +232,10 @@ class CaseFile(BaseModel):
 
     # Agent 5
     suitability: Optional[Suitability] = None
+    decision: Optional[Decision] = None          # build/buy/pilot/modify/reject + ROI
+
+    # post-decision tracking
+    outcomes: List[OutcomeEntry] = Field(default_factory=list)
 
     # accounting
     cost_spent_usd: float = 0.0
@@ -203,11 +259,25 @@ class CaseFile(BaseModel):
 
     # ── persistence ──────────────────────────────────────────────────────
     def save(self, run_dir: Path | str) -> Path:
+        """Atomic: write-then-replace, so a concurrent reader (the UI polls while
+        agent threads save) always sees a complete file — old or new, never partial."""
         run_dir = Path(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         self.touch()
         path = run_dir / "casefile.json"
-        path.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        tmp = run_dir / f".casefile.{uuid.uuid4().hex[:8]}.tmp"
+        body = self.model_dump_json(indent=2)
+        tmp.write_text(body, encoding="utf-8")
+        import os
+        import time
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)   # atomic; Windows can transiently deny while a reader holds it
+                return path
+            except PermissionError:
+                time.sleep(0.02 * (attempt + 1))
+        tmp.unlink(missing_ok=True)
+        path.write_text(body, encoding="utf-8")  # last resort: direct write beats losing state
         return path
 
     @classmethod

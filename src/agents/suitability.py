@@ -12,10 +12,11 @@ import json
 
 from src.agents._common import (build_parser, checkpoint_and_exit, context_from_args,
                                 load_or_new, save_and_report)
-from src.state.casefile import CaseFile, Suitability, VERDICTS
+from src.state.casefile import (CaseFile, Decision, DECISION_ACTIONS, PilotPlan,
+                                ROIEstimate, Suitability, VERDICTS)
 from src.tools.costs import BudgetExceeded
-from src.tools.models import RunContext, llm_json, load_prompt
-from src.tools.reports import render_html, render_ppt
+from src.tools.models import RunContext, llm_json, load_prompt, load_yaml, CONFIG_DIR
+from src.tools.reports import render_html, render_one_pager, render_ppt
 
 
 def _evidence_block(case: CaseFile) -> str:
@@ -74,6 +75,7 @@ def run(case: CaseFile, ctx: RunContext) -> CaseFile:
         raise SystemExit("suitability: could not obtain a valid, evidence-cited verdict")
 
     case.suitability = verdict
+    _decide(case, ctx)
     case.status = "complete"
     case.next_agent = None
 
@@ -86,14 +88,78 @@ def run(case: CaseFile, ctx: RunContext) -> CaseFile:
         print(f"\nBetter path: {verdict.better_path}")
     print(f"\nEvidence: {', '.join(verdict.cited_finding_ids)}")
 
-    # refresh the deliverables with the verdict on them
+    if case.decision:
+        d = case.decision
+        print(f"\nDECISION: {d.action.upper()}"
+              + (f" — {d.recommended_option}" if d.recommended_option else ""))
+        if d.roi.monthly_value_usd:
+            print(f"  ROI (estimate): ~{d.roi.hours_saved_per_month:g} h/month ≈ "
+                  f"${d.roi.monthly_value_usd:,.0f}/month · payback "
+                  f"{d.roi.payback_months_low:g}–{d.roi.payback_months_high:g} months")
+
+    # refresh the deliverables with the verdict + decision on them
     reports_dir = ctx.run_dir / "reports"
     html = render_html(case, reports_dir / "detailed_analysis.html")
     print(f"[reports] {html}")
+    one_pager = render_one_pager(case, reports_dir / "one_pager.html")
+    print(f"[reports] {one_pager}")
     ppt = render_ppt(case, reports_dir / "overview.pptx")
     if ppt:
         print(f"[reports] {ppt}")
     return case
+
+
+def _decide(case: CaseFile, ctx: RunContext) -> None:
+    """Turn the verdict into build/buy/pilot/modify/reject + ROI. Evidence-bound;
+    a failure here never voids the suitability verdict itself."""
+    hourly = (load_yaml(str(CONFIG_DIR / "research.yaml")).get("cost") or {}).get("hourly_rate_usd", 120)
+    payload = json.dumps({
+        "verdict": case.suitability.model_dump() if case.suitability else None,
+        "problem_statement": case.problem_statement,
+        "captured": [c.model_dump() for c in case.captured],
+        "hourly_rate_usd": hourly,
+        "tool_landscape": {
+            cat: [{"name": o.name, "similarity": o.similarity.model_dump(),
+                   "costs": o.costs.model_dump(), "scores": o.scores,
+                   "vendor_only": o.vendor_only, "community_only": o.community_only}
+                  for o in options]
+            for cat, options in case.tool_landscape.items()},
+        "future_workflow": [s.model_dump() for s in case.future_workflow],
+    }, indent=2)
+    transcript = [{"role": "user", "content": f"Evidence:\n{payload}"}]
+    system = load_prompt("decision")
+    option_names = {o.name.lower() for opts in case.tool_landscape.values() for o in opts}
+    for attempt in range(2):
+        try:
+            data = llm_json(messages=transcript, role="lead", system=system, ctx=ctx,
+                            purpose="decision + ROI")
+            rec = data.get("recommended_option")
+            if data.get("action") in ("buy", "pilot") and (not rec or rec.lower() not in option_names):
+                raise ValueError(f"action {data.get('action')!r} must name a landscape option")
+            pilot = data.get("pilot_plan")
+            case.decision = Decision(
+                action=str(data.get("action", "")).strip(),
+                recommended_option=rec,
+                rationale=data.get("rationale", ""),
+                pilot_plan=PilotPlan(**{k: v for k, v in (pilot or {}).items()
+                                        if k in PilotPlan.model_fields}) if pilot else None,
+                roi=ROIEstimate(**{k: v for k, v in (data.get("roi") or {}).items()
+                                   if k in ROIEstimate.model_fields}),
+                cited_finding_ids=[fid for fid in data.get("cited_finding_ids", [])
+                                   if case.get_finding(fid)],
+            )
+            return
+        except (ValueError, TypeError) as e:
+            transcript.append({"role": "assistant", "content": json.dumps(data) if 'data' in locals() else ""})
+            transcript.append({"role": "user",
+                               "content": f"Invalid output ({e}). action must be one of "
+                                          f"{DECISION_ACTIONS}; buy/pilot must name a real option. Re-emit."})
+        except Exception as e:  # noqa: BLE001 — decision is additive, never fatal
+            ctx.emit("error", agent="suitability", error=f"decision layer failed: {e}",
+                     recovered=True, impact="verdict stands; no build/buy/pilot decision recorded")
+            return
+    ctx.emit("error", agent="suitability", error="decision layer: no valid output after retry",
+             recovered=True, impact="verdict stands; no decision recorded")
 
 
 def main() -> None:

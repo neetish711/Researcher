@@ -32,12 +32,24 @@ vercel --prod --yes
 ```
 
 CLI agents are interactive (`input()` gates); don't run them in a non-interactive shell without
-`--no-gates`. Env vars that matter: `CRED_SECRET` (vault encryption — required on serverless or
-saved keys become undecryptable), `LLM_COST_PER_MTOK_INPUT/OUTPUT` (cost accounting; no model is
-pinned so price is an assumption), `CONTACT_EMAIL` (OpenAlex/Crossref polite pool), `RUNS_DIR`/
-`DATA_DIR` (state roots; `api/index.py` points both at /tmp on Vercel).
+`--no-gates`. Env vars that matter: `CONSOLE_TOKEN` (when set, every API route requires it —
+header `x-console-token` or `?token=` on downloads; unset = open, for local dev only),
+`CRED_SECRET` (vault encryption — required on serverless or saved keys become undecryptable),
+`LLM_COST_PER_MTOK_INPUT/OUTPUT` (cost accounting; no model is pinned so price is an assumption),
+`CONTACT_EMAIL` (OpenAlex/Crossref polite pool), `RUNS_DIR`/`DATA_DIR` (state roots;
+`api/index.py` points both at /tmp on Vercel).
 
 ## Architecture
+
+**The consultative loop is server-native.** Discovery persists its
+`open_interview_questions` on the CaseFile; `POST /runs/{id}/answers` appends to
+`interview_log` and re-runs discovery with the fuller transcript. Every gate supports
+`POST /runs/{id}/revise` (feedback lands in `case.gate_feedback[gate]`, the owning agent
+regenerates — `approve_plan` also clears `research_plan`). Agent 5 emits both a
+`Suitability` verdict (solution shape) and a `Decision` (build/buy/pilot/modify
+process/reject + ROI + pilot plan, prompt `src/prompts/decision.md`); post-decision
+actuals go to `POST /runs/{id}/outcomes`. CaseFile saves are atomic
+(write-then-replace with Windows retry) because the UI polls while agent threads save.
 
 **One CaseFile, one run() per agent, three frontends.** All state flows through `CaseFile`
 (`src/state/casefile.py`, pydantic v2) saved at `runs/<id>/casefile.json`. Each agent exposes

@@ -56,7 +56,10 @@ def run(case: CaseFile, ctx: RunContext) -> CaseFile:
         print("[mapping] warning: problem was never confirmed by a human")
 
     system = load_prompt("mapping")
-    transcript = [{"role": "user", "content": f"Discovery output:\n{_context_block(case)}"}]
+    first = f"Discovery output:\n{_context_block(case)}"
+    for note in case.gate_feedback.get("validate_map", []):
+        first += f"\n\nHuman feedback on the previous map — revise accordingly:\n{note}"
+    transcript = [{"role": "user", "content": first}]
 
     for revision in range(MAX_REVISIONS + 1):
         data = llm_json(messages=transcript, role="lead", system=system, ctx=ctx)

@@ -108,6 +108,36 @@ def render_html(case: CaseFile, path: Path | str) -> Path:
                 f"<p>{_esc(s.rationale)}</p>"
                 f"<p>Cited findings: {_esc(', '.join(s.cited_finding_ids))}</p></section>")
 
+    # the decision LEADS the report — evidence follows for readers who want it
+    decision = ""
+    if case.decision:
+        d = case.decision
+        roi = d.roi
+        pilot = ""
+        if d.pilot_plan:
+            p = d.pilot_plan
+            pilot = (f"<p><strong>Pilot plan:</strong> {_esc(p.scope)} — {p.duration_weeks} weeks.<br>"
+                     f"Success criteria: {_esc('; '.join(p.success_criteria))}<br>"
+                     f"Edge cases to test: {_esc('; '.join(p.edge_cases_to_test))}<br>"
+                     f"Approvals needed: {_esc('; '.join(p.approvals_needed) or 'none identified')}</p>")
+        roi_row = ""
+        if roi.monthly_value_usd or roi.hours_saved_per_month:
+            roi_row = (f"<table><tr><th>Hours saved / month {_badge('estimate')}</th>"
+                       f"<th>Value / month {_badge('estimate')}</th><th>Implementation {_badge('estimate')}</th>"
+                       f"<th>Payback {_badge('estimate')}</th></tr>"
+                       f"<tr><td>{roi.hours_saved_per_month:g}</td>"
+                       f"<td>${roi.monthly_value_usd:,.0f}</td>"
+                       f"<td>${roi.implementation_cost_usd_low:,.0f}–${roi.implementation_cost_usd_high:,.0f}</td>"
+                       f"<td>{roi.payback_months_low:g}–{roi.payback_months_high:g} months</td></tr></table>"
+                       f"<details><summary>ROI assumptions</summary><ul>"
+                       + "".join(f"<li>{_esc(a)}</li>" for a in roi.assumptions) + "</ul></details>")
+        decision = (f'<section id="decision" style="border:2px solid #1a7f37;border-radius:10px;'
+                    f'padding:4px 18px;background:#f0fff4"><h2>Recommendation</h2>'
+                    f'<p class="verdict">{_esc(d.action.upper())}'
+                    + (f" — {_esc(d.recommended_option)}" if d.recommended_option else "")
+                    + f"</p><p>{_esc(d.rationale)}</p>{roi_row}{pilot}"
+                    f"<p class=\"evidence\">Evidence: {_esc(', '.join(d.cited_finding_ids))}</p></section>")
+
     open_qs = "".join(f"<li>{_esc(q)}</li>" for q in case.open_questions) or "<li>none</li>"
 
     doc = f"""<!doctype html>
@@ -132,10 +162,10 @@ def render_html(case: CaseFile, path: Path | str) -> Path:
  .method,.evidence,.scores{{color:#57606a;font-size:.9em}}
  div.scroll{{overflow-x:auto}}
 </style></head><body><main>
-<h1>Opportunity-to-Solution — detailed analysis <small>run {_esc(case.run_id)}</small></h1>
+<h1>{_esc(case.title or 'Opportunity-to-Solution')} — detailed analysis <small>run {_esc(case.run_id)}</small></h1>
 <p class="legend">Every number is labeled: {_badge('fact')} directly cited ·
 {_badge('estimate')} derived, method shown · {_badge('assumption')} unverified.</p>
-
+{decision}
 <section><h2>Problem</h2><p>{_esc(case.problem_statement)}</p>
 <p><strong>Stated:</strong> {_esc(case.stated_vs_real.get('stated', ''))}<br>
 <strong>Real:</strong> {_esc(case.stated_vs_real.get('real', ''))}</p></section>
@@ -185,6 +215,68 @@ document.querySelectorAll('#matrix th').forEach((th,i)=>th.onclick=()=>{{
     return path
 
 
+def render_one_pager(case: CaseFile, path: Path | str) -> Path:
+    """Executive one-pager: problem → recommendation → ROI → risks → next step.
+    The artifact a stakeholder forwards; everything else is backup."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    d, s = case.decision, case.suitability
+    top = sorted((o for opts in case.tool_landscape.values() for o in opts),
+                 key=lambda o: -(o.similarity.index or 0))[:3]
+    risks = []
+    for o in top:
+        if o.vendor_only:
+            risks.append(f"{o.name}: evidence is vendor-only (unverified independently)")
+        if o.community_only:
+            risks.append(f"{o.name}: anecdote-only evidence")
+    for item in case.data_inventory:
+        if item.sensitivity in ("confidential", "regulated"):
+            risks.append(f"data '{item.name}' is {item.sensitivity} — needs security/compliance review")
+    unresolved = [c.field for c in case.captured if c.status == "missing"]
+    if unresolved:
+        risks.append(f"never captured: {', '.join(unresolved[:5])}")
+    roi_html = ""
+    if d and (d.roi.monthly_value_usd or d.roi.hours_saved_per_month):
+        roi_html = (f"<div class='kpis'><div><b>{d.roi.hours_saved_per_month:g}</b><span>hours/month saved "
+                    f"{_badge('estimate')}</span></div><div><b>${d.roi.monthly_value_usd:,.0f}</b>"
+                    f"<span>value/month {_badge('estimate')}</span></div>"
+                    f"<div><b>{d.roi.payback_months_low:g}–{d.roi.payback_months_high:g}</b>"
+                    f"<span>months payback {_badge('estimate')}</span></div></div>")
+    next_step = ("Run the pilot: " + d.pilot_plan.scope if d and d.pilot_plan and d.action in ("pilot", "build")
+                 else f"Proceed with {d.recommended_option}" if d and d.recommended_option
+                 else d.rationale.split(".")[0] if d else "Complete the research run for a recommendation.")
+    doc = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>{_esc(case.title or case.run_id)} — decision brief</title>
+<style>
+ body{{font:15px/1.5 system-ui,sans-serif;color:#1f2328;max-width:760px;margin:24px auto;padding:0 16px}}
+ h1{{font-size:1.3em;margin-bottom:2px}} .sub{{color:#57606a;font-size:.85em}}
+ .rec{{border:2px solid #1a7f37;background:#f0fff4;border-radius:10px;padding:12px 18px;margin:16px 0}}
+ .rec .action{{font-size:1.5em;font-weight:800}}
+ .kpis{{display:flex;gap:24px;margin:10px 0}} .kpis div{{text-align:center}}
+ .kpis b{{font-size:1.4em;display:block}} .kpis span{{font-size:.75em;color:#57606a}}
+ .badge{{color:#fff;border-radius:10px;padding:0 7px;font-size:.7em}}
+ ul{{margin:4px 0}} h2{{font-size:1em;text-transform:uppercase;letter-spacing:.5px;color:#57606a;margin:18px 0 4px}}
+</style></head><body>
+<h1>{_esc(case.title or 'AI/automation opportunity')} </h1>
+<p class="sub">Decision brief · run {_esc(case.run_id)} · {_esc(case.updated_at[:10])} ·
+facts cited, estimates labeled — full evidence in the detailed report</p>
+<h2>Problem</h2><p>{_esc(case.problem_statement)}</p>
+{f'<div class="rec"><div class="action">{_esc(d.action.upper())}'
+ + (f" — {_esc(d.recommended_option)}" if d.recommended_option else "") + f'</div>'
+ + f'<p>{_esc(d.rationale)}</p>{roi_html}</div>' if d else
+ f'<div class="rec"><div class="action">{_esc(s.verdict.upper() if s else "IN PROGRESS")}</div></div>'}
+<h2>Options considered</h2><ul>
+{''.join(f"<li><b>{_esc(o.name)}</b> ({_esc(o.category)}) — similarity {o.similarity.index}/100, "
+         f"~${o.costs.monthly_operation_usd:,.0f}/month {_badge('estimate')}"
+         f"{' — <b>already exists</b>' if o.similarity.existing_solution else ''}</li>" for o in top)
+ or '<li>none surfaced</li>'}</ul>
+<h2>Risks & open items</h2><ul>{''.join(f'<li>{_esc(r)}</li>' for r in risks) or '<li>none flagged</li>'}</ul>
+<h2>Next step</h2><p>{_esc(next_step)}</p>
+</body></html>"""
+    path.write_text(doc, encoding="utf-8")
+    return path
+
+
 def render_ppt(case: CaseFile, path: Path | str) -> Path | None:
     try:
         from pptx import Presentation
@@ -214,9 +306,23 @@ def render_ppt(case: CaseFile, path: Path | str) -> Path | None:
             para.text = line
             para.font.size = Pt(15)
 
-    slide(f"Opportunity-to-Solution — run {case.run_id}",
+    slide(f"{case.title or 'Opportunity-to-Solution'} — run {case.run_id}",
           [case.problem_statement or "(no problem statement)",
            "", "fact = cited · estimate = derived (method shown) · assumption = unverified"])
+
+    if case.decision:  # the decision comes FIRST
+        d = case.decision
+        lines = [f"RECOMMENDATION: {d.action.upper()}"
+                 + (f" — {d.recommended_option}" if d.recommended_option else ""),
+                 d.rationale]
+        if d.roi.monthly_value_usd or d.roi.hours_saved_per_month:
+            lines.append(f"ROI (estimate): {d.roi.hours_saved_per_month:g} h/month ≈ "
+                         f"${d.roi.monthly_value_usd:,.0f}/month · payback "
+                         f"{d.roi.payback_months_low:g}–{d.roi.payback_months_high:g} months")
+        if d.pilot_plan:
+            lines.append(f"Pilot: {d.pilot_plan.scope} ({d.pilot_plan.duration_weeks} weeks) — "
+                         + "; ".join(d.pilot_plan.success_criteria[:3]))
+        slide("Recommendation", lines)
 
     slide("Stated vs real problem",
           [f"Stated: {case.stated_vs_real.get('stated', '')}",

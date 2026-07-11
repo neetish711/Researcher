@@ -9,7 +9,6 @@ Standalone: python -m src.agents.discovery [--problem "..."] [--model <id>]
 """
 from __future__ import annotations
 
-import json
 from typing import List
 
 from src.agents._common import (build_parser, checkpoint_and_exit, context_from_args,
@@ -44,6 +43,19 @@ def _print_summary(case: CaseFile) -> None:
         print(f"  [{d.status:<10}] {d.name} ({d.format}, {d.sensitivity}) — {d.location}")
 
 
+def _transcript(case: CaseFile, problem: str) -> List[dict]:
+    """Rebuild the interview from persisted state — this is what lets the web UI
+    answer questions across requests and lets revisions regenerate with context."""
+    parts = [f"Stated business problem:\n{problem}"]
+    if case.interview_log:
+        parts.append("Interview so far:\n" + "\n\n".join(
+            f"Q: {e.get('question', '')}\nA: {e.get('answer', '') or '(no answer — treat as missing)'}"
+            for e in case.interview_log))
+    for note in case.gate_feedback.get("confirm_problem", []):
+        parts.append(f"Human feedback on the previous summary — revise accordingly:\n{note}")
+    return [{"role": "user", "content": "\n\n".join(parts)}]
+
+
 def run(case: CaseFile, ctx: RunContext, problem: str = "") -> CaseFile:
     system = load_prompt("discovery")
     if not problem:
@@ -53,26 +65,31 @@ def run(case: CaseFile, ctx: RunContext, problem: str = "") -> CaseFile:
     if not problem:
         raise SystemExit("discovery needs a problem statement (--problem or interactive input)")
 
-    transcript: List[dict] = [{"role": "user", "content": f"Stated business problem:\n{problem}"}]
     data: dict = {}
     for turn in range(MAX_INTERVIEW_TURNS):
-        data = llm_json(messages=transcript, role="lead", system=system, ctx=ctx)
+        data = llm_json(messages=_transcript(case, problem), role="lead", system=system,
+                        ctx=ctx, purpose="discovery interview")
         _apply(case, data)
-        questions = data.get("follow_up_questions") or []
-        if data.get("coverage_complete") or not questions:
+        questions = [str(q) for q in (data.get("follow_up_questions") or [])]
+        case.open_interview_questions = [] if data.get("coverage_complete") else questions
+        if not case.open_interview_questions:
             break
         if not ctx.interactive:
-            print(f"[discovery] unattended mode: accepting {len(questions)} open questions as assumptions")
+            # server mode: persist the questions — the UI answers them via
+            # POST /runs/{id}/answers, which re-runs this agent with a fuller log
+            print(f"[discovery] {len(questions)} open questions await answers in the console")
             break
         print(f"\n[discovery] round {turn + 1} — {len(questions)} gaps to close:")
-        answers = []
         for q in questions:
             a = input(f"  Q: {q}\n  A: ").strip()
-            answers.append(f"Q: {q}\nA: {a or '(no answer — treat as missing)'}")
-        transcript.append({"role": "assistant", "content": json.dumps(data)})
-        transcript.append({"role": "user", "content": "\n\n".join(answers)})
+            case.interview_log.append({"question": q, "answer": a})
+        case.open_interview_questions = []
 
     _print_summary(case)
+    if case.open_interview_questions:
+        print("\nOpen questions (answer via the console, or approve to accept as assumptions):")
+        for q in case.open_interview_questions:
+            print(f"  ? {q}")
 
     # ── human gate: confirm problem + data ──
     if gate("Confirm this problem statement and data inventory?", ctx, "confirm_problem"):

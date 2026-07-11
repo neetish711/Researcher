@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useState } from 'react'
-import { api, usePoll, useEvents, KEY_RE, KEY_MSG, fmtUsd, fmtDur } from '../api.js'
+import { api, usePoll, useEvents, KEY_RE, KEY_MSG, fmtUsd, fmtDur, getOperator, tokenQS } from '../api.js'
 import { Btn, Card, ErrorNote, Input, Json, Modal, Pill, Select, Table, statusKind, useAsync } from '../lib.jsx'
 
 const AGENTS = ['discovery', 'mapping', 'research', 'suitability']
@@ -302,11 +302,6 @@ export default function RunConsole({ runId }) {
     (!filter.q || JSON.stringify(e).toLowerCase().includes(filter.q.toLowerCase())))
   const types = [...new Set(events.map(e => e.type))].sort()
 
-  const approve = () => wrap(() => api(`/runs/${runId}/approve`, { method: 'POST' }))
-  const rejectGate = () => {
-    const reason = prompt('Why are you rejecting? (recorded in the event log)') || ''
-    return wrap(() => api(`/runs/${runId}/reject`, { method: 'POST', body: { reason } }))
-  }
   const resume = () => wrap(() => api(`/runs/${runId}/resume`, { method: 'POST' }))
 
   const rejectedFindings = events.filter(e => e.type === 'citation_rejected')
@@ -316,7 +311,8 @@ export default function RunConsole({ runId }) {
     <div className="space-y-3">
       {/* header + flow */}
       <div className="flex items-center gap-3 flex-wrap">
-        <h1 className="text-lg font-bold text-zinc-100 font-mono">{runId}</h1>
+        <h1 className="text-lg font-bold text-zinc-100">{cf.title || <span className="font-mono">{runId}</span>}</h1>
+        {cf.title && <span className="font-mono text-xs text-zinc-600">{runId}</span>}
         <Pill kind={statusKind(sm.status)}>{sm.status.slice(0, 60)}</Pill>
         <span className="text-xs text-zinc-500">{fmtUsd(sm.cost_spent_usd)} · {sm.llm_calls} calls</span>
         {(sm.status.startsWith('error') || sm.status === 'paused_budget') && <>
@@ -347,17 +343,8 @@ export default function RunConsole({ runId }) {
       <MetricsStrip m={metrics} cf={cf} />
       <QuotaStrip visible={sm.status.startsWith('running') || sm.status.startsWith('awaiting')} />
 
-      {gate && (
-        <div className="border border-amber-600 bg-amber-950/30 rounded-lg p-4">
-          <p className="font-semibold text-amber-300">⏸ Waiting for you: {GATE_LABEL[gate] || gate}</p>
-          <Json value={run.gate_payload} className="max-h-64 overflow-y-auto my-2" />
-          <div className="flex gap-2">
-            <Btn variant="approve" onClick={approve}>Approve & continue</Btn>
-            <Btn variant="danger" onClick={rejectGate}>Reject</Btn>
-            <Btn onClick={() => setRetry(true)}>Change model first…</Btn>
-          </div>
-        </div>
-      )}
+      {gate && <GateReview gate={gate} payload={run.gate_payload} runId={runId}
+                           onModelChange={() => setRetry(true)} />}
       {sm.status.startsWith('error') && (
         <div className="border border-red-700 bg-red-950/30 rounded-lg p-4 text-sm">
           <p className="text-red-300 break-words">{sm.status}</p>
@@ -422,7 +409,9 @@ export default function RunConsole({ runId }) {
 
       {tab === 'results' && (
         <div className="space-y-3">
-          {cf.suitability && <Card title="Verdict">
+          <DecisionCard d={cf.decision} />
+          {(cf.decision || cf.suitability) && <OutcomesCard runId={runId} cf={cf} />}
+          {cf.suitability && <Card title="Suitability verdict (the shape of the solution)">
             <p className="text-2xl font-bold text-emerald-400">{cf.suitability.verdict}</p>
             <p className="text-xs text-zinc-400 mt-1">{Object.entries(cf.suitability.scores || {}).map(([k, v]) => `${k} ${v}/10`).join(' · ')}</p>
             <p className="text-sm text-zinc-300 mt-2 whitespace-pre-wrap">{cf.suitability.rationale}</p>
@@ -459,8 +448,8 @@ export default function RunConsole({ runId }) {
                 <span className="break-all text-zinc-500">{e.url}</span>, e.action, e.reason])} />
           </Card>
           {filesD?.files?.find(f => f.name === 'report.html' && f.available) && (
-            <Card title="Detailed report" right={<a className="text-sky-400 text-xs hover:underline" href={`/runs/${runId}/report`} target="_blank" rel="noreferrer">open in tab ↗</a>}>
-              <iframe title="report" src={`/runs/${runId}/report`} className="w-full h-[600px] bg-white rounded" />
+            <Card title="Detailed report" right={<a className="text-sky-400 text-xs hover:underline" href={`/runs/${runId}/report${tokenQS()}`} target="_blank" rel="noreferrer">open in tab ↗</a>}>
+              <iframe title="report" src={`/runs/${runId}/report${tokenQS()}`} className="w-full h-[600px] bg-white rounded" />
             </Card>)}
         </div>
       )}
@@ -484,7 +473,7 @@ export default function RunConsole({ runId }) {
                 <span className="font-mono text-zinc-300">{f.name}</span>
                 {f.available ? <>
                   <span className="text-zinc-600 text-xs">{(f.size / 1024).toFixed(1)} KB</span>
-                  <a className="ml-auto text-sky-400 text-xs hover:underline" href={f.url} download>download</a>
+                  <a className="ml-auto text-sky-400 text-xs hover:underline" href={`${f.url}${tokenQS()}`} download>download</a>
                 </> : <span className="ml-auto text-zinc-600 text-xs">not generated yet</span>}
               </div>))}
             <p className="text-[11px] text-zinc-600 mt-2">Serverless note: run state is ephemeral — download as soon as ready.</p>
@@ -512,6 +501,184 @@ export default function RunConsole({ runId }) {
         onRetry={(sm.status.startsWith('error') || sm.status === 'paused_budget') ? () => { setDetail(null); setRetry(true) } : null} />}
       {retry && <RetryModal runId={runId} providers={providers || []} onClose={() => setRetry(false)} onDone={() => setErr(null)} />}
     </div>
+  )
+}
+
+const STATUS_TINT = { confirmed: 'text-emerald-400', assumption: 'text-amber-400', missing: 'text-red-400' }
+const LABEL_TINT = { 'AI-assist': 'text-sky-300', 'deterministic-automation': 'text-emerald-300',
+                     'human-owned': 'text-amber-300', 'redesign-first': 'text-red-300' }
+
+/** Human-readable gate review: what you're approving, rendered — not raw JSON.
+    confirm_problem additionally hosts the interview (answer the agent's questions). */
+function GateReview({ gate, payload, runId, onModelChange }) {
+  const [answers, setAnswers] = useState({})
+  const [feedback, setFeedback] = useState('')
+  const [showRevise, setShowRevise] = useState(false)
+  const { busy, err, wrap } = useAsync()
+  const by = getOperator()
+
+  const approve = () => wrap(() => api(`/runs/${runId}/approve`, { method: 'POST', body: { by } }))
+  const rejectGate = () => {
+    const reason = prompt('Why are you rejecting? (recorded in the event log)')
+    if (reason === null) return
+    return wrap(() => api(`/runs/${runId}/reject`, { method: 'POST', body: { reason, by } }))
+  }
+  const revise = () => wrap(async () => {
+    await api(`/runs/${runId}/revise`, { method: 'POST', body: { feedback, by } })
+    setShowRevise(false); setFeedback('')
+  })
+  const questions = payload?.open_interview_questions || []
+  const submitAnswers = () => wrap(() => api(`/runs/${runId}/answers`, {
+    method: 'POST',
+    body: { answers: questions.map(q => ({ question: q, answer: answers[q] || '' }))
+                     .filter(a => a.answer.trim()) },
+  }))
+
+  return (
+    <div className="border border-amber-600 bg-amber-950/20 rounded-lg p-4 space-y-3">
+      <p className="font-semibold text-amber-300">⏸ Waiting for you: {GATE_LABEL[gate] || gate}</p>
+
+      {gate === 'confirm_problem' && payload && <>
+        {questions.length > 0 && (
+          <div className="bg-zinc-900 border border-sky-800 rounded-lg p-3">
+            <p className="text-sm font-semibold text-sky-300 mb-2">
+              The discovery agent has {questions.length} question{questions.length > 1 ? 's' : ''} for you
+              <span className="text-zinc-500 font-normal"> — answer what you can; approving skips the rest as assumptions</span></p>
+            {questions.map(q => (
+              <div key={q} className="mb-2">
+                <p className="text-sm text-zinc-300">{q}</p>
+                <Input value={answers[q] || ''} onChange={e => setAnswers({ ...answers, [q]: e.target.value })}
+                       placeholder="your answer…" />
+              </div>))}
+            <Btn variant="primary" disabled={busy || !Object.values(answers).some(v => v.trim())}
+                 onClick={submitAnswers}>Submit answers — continue the interview</Btn>
+          </div>)}
+        <div><p className="text-sm text-zinc-200"><b>Real problem:</b> {payload.problem_statement || '—'}</p>
+          {payload.stated_vs_real?.stated &&
+            <p className="text-xs text-zinc-400 mt-1"><b>As stated:</b> {payload.stated_vs_real.stated}
+              {payload.stated_vs_real.evidence && <> · <b>why different:</b> {payload.stated_vs_real.evidence}</>}</p>}
+        </div>
+        <Table headers={['field', 'value', 'status']}
+          rows={(payload.captured || []).map(c => [c.field, c.value,
+            <b className={STATUS_TINT[c.status] || ''}>{c.status}</b>])} />
+        {(payload.data_inventory || []).length > 0 &&
+          <Table headers={['data', 'format', 'location', 'sensitivity', 'status']}
+            rows={payload.data_inventory.map(d => [d.name, d.format, d.location,
+              <b className={d.sensitivity === 'confidential' || d.sensitivity === 'regulated' ? 'text-red-400' : ''}>{d.sensitivity}</b>,
+              <b className={STATUS_TINT[d.status] || ''}>{d.status}</b>])} />}
+      </>}
+
+      {gate === 'validate_map' && payload && <>
+        <p className="text-[11px] uppercase tracking-widest text-zinc-500">Current workflow</p>
+        <Table headers={['id', 'step', 'actor', 'system', 'time', 'pain']}
+          rows={(payload.current_workflow || []).map(s => [s.id, s.name, s.actor, s.system,
+            s.time_estimate, (s.pain_points || []).join('; ')])} />
+        <p className="text-[11px] uppercase tracking-widest text-zinc-500">Proposed future workflow</p>
+        <Table headers={['id', 'step', 'label', 'why']}
+          rows={(payload.future_workflow || []).map(s => [s.id, s.name,
+            <b className={LABEL_TINT[s.label] || ''}>{s.label}</b>, s.rationale])} />
+      </>}
+
+      {gate === 'approve_plan' && payload && <>
+        <p className="text-sm text-zinc-200"><b>Target profile:</b> {payload.target_profile}</p>
+        <p className="text-sm text-zinc-300"><b>Capabilities to research:</b> {(payload.capabilities || []).join(' · ')}</p>
+        <div><p className="text-[11px] uppercase tracking-widest text-zinc-500 mb-1">Research questions</p>
+          <ul className="text-sm text-zinc-400 list-disc pl-5">{(payload.questions || []).map((q, i) => <li key={i}>{q}</li>)}</ul></div>
+        <p className="text-xs text-zinc-500">Sources: {(payload.source_criteria || []).join('; ')}</p>
+        <p className="text-xs text-amber-400">Approving starts the deep research loop — check the quota forecast first if unsure.</p>
+      </>}
+
+      <div className="flex gap-2 flex-wrap items-start">
+        <Btn variant="approve" disabled={busy} onClick={approve}>Approve & continue</Btn>
+        <Btn disabled={busy} onClick={() => setShowRevise(!showRevise)}>Request changes…</Btn>
+        <Btn variant="danger" disabled={busy} onClick={rejectGate}>Reject</Btn>
+        <Btn variant="ghost" onClick={onModelChange}>Change model first…</Btn>
+      </div>
+      {showRevise && (
+        <div className="flex gap-2 items-start">
+          <textarea value={feedback} onChange={e => setFeedback(e.target.value)} rows={2}
+            placeholder="What's wrong or missing? The agent regenerates with this feedback."
+            className="flex-1 bg-zinc-950 border border-zinc-700 rounded px-2.5 py-1.5 text-sm focus:outline-none focus:border-sky-600" />
+          <Btn variant="primary" disabled={busy || !feedback.trim()} onClick={revise}>Send & regenerate</Btn>
+        </div>)}
+      <ErrorNote>{err}</ErrorNote>
+    </div>
+  )
+}
+
+/** the executive answer: build/buy/pilot/modify/reject + ROI + pilot plan */
+function DecisionCard({ d }) {
+  if (!d) return null
+  const roi = d.roi || {}
+  return (
+    <div className="border-2 border-emerald-700 bg-emerald-950/20 rounded-lg p-4">
+      <p className="text-[11px] uppercase tracking-widest text-emerald-500 mb-1">Recommendation</p>
+      <p className="text-2xl font-extrabold text-emerald-300">{d.action.toUpperCase()}
+        {d.recommended_option && <span className="text-emerald-400"> — {d.recommended_option}</span>}</p>
+      <p className="text-sm text-zinc-300 mt-1">{d.rationale}</p>
+      {(roi.monthly_value_usd > 0 || roi.hours_saved_per_month > 0) && (
+        <div className="flex gap-8 mt-3">
+          <div><p className="text-xl font-bold text-zinc-100">{roi.hours_saved_per_month?.toLocaleString()}</p>
+            <p className="text-[11px] text-zinc-500">hours/month saved (estimate)</p></div>
+          <div><p className="text-xl font-bold text-zinc-100">${roi.monthly_value_usd?.toLocaleString()}</p>
+            <p className="text-[11px] text-zinc-500">value/month (estimate)</p></div>
+          <div><p className="text-xl font-bold text-zinc-100">{roi.payback_months_low}–{roi.payback_months_high}</p>
+            <p className="text-[11px] text-zinc-500">months payback (estimate)</p></div>
+        </div>)}
+      {roi.assumptions?.length > 0 && (
+        <details className="mt-2"><summary className="text-xs text-zinc-500 cursor-pointer">ROI assumptions</summary>
+          <ul className="text-xs text-zinc-400 list-disc pl-5 mt-1">{roi.assumptions.map((a, i) => <li key={i}>{a}</li>)}</ul>
+        </details>)}
+      {d.pilot_plan && (
+        <div className="mt-3 bg-zinc-900/70 border border-zinc-800 rounded p-3 text-sm">
+          <p className="font-semibold text-zinc-200">Pilot plan — {d.pilot_plan.duration_weeks} weeks</p>
+          <p className="text-zinc-400">{d.pilot_plan.scope}</p>
+          <p className="text-xs text-zinc-500 mt-1"><b>Success criteria:</b> {(d.pilot_plan.success_criteria || []).join('; ')}</p>
+          {d.pilot_plan.edge_cases_to_test?.length > 0 &&
+            <p className="text-xs text-zinc-500"><b>Edge cases to test:</b> {d.pilot_plan.edge_cases_to_test.join('; ')}</p>}
+          {d.pilot_plan.approvals_needed?.length > 0 &&
+            <p className="text-xs text-amber-400"><b>Approvals needed:</b> {d.pilot_plan.approvals_needed.join('; ')}</p>}
+        </div>)}
+      <p className="text-[11px] text-zinc-600 mt-2">evidence: {(d.cited_finding_ids || []).join(', ') || '—'}</p>
+    </div>
+  )
+}
+
+/** post-decision tracking: log actuals against the ROI estimate */
+function OutcomesCard({ runId, cf }) {
+  const [form, setForm] = useState({ adoption_pct: '', hours: '', notes: '' })
+  const { busy, err, wrap } = useAsync()
+  const submit = () => wrap(() => api(`/runs/${runId}/outcomes`, {
+    method: 'POST', body: {
+      adoption_pct: form.adoption_pct === '' ? null : Number(form.adoption_pct),
+      hours_saved_per_month: form.hours === '' ? null : Number(form.hours),
+      notes: form.notes, recorded_by: getOperator(),
+    },
+  }).then(() => setForm({ adoption_pct: '', hours: '', notes: '' })))
+  const est = cf.decision?.roi?.hours_saved_per_month
+  return (
+    <Card title="Outcome tracking — actuals vs the estimate">
+      <div className="flex gap-2 items-end flex-wrap">
+        <div className="w-28"><p className="text-xs text-zinc-500 mb-1">adoption %</p>
+          <Input type="number" min="0" max="100" value={form.adoption_pct}
+                 onChange={e => setForm({ ...form, adoption_pct: e.target.value })} /></div>
+        <div className="w-36"><p className="text-xs text-zinc-500 mb-1">hours saved / month</p>
+          <Input type="number" value={form.hours} onChange={e => setForm({ ...form, hours: e.target.value })} /></div>
+        <div className="flex-1 min-w-[200px]"><p className="text-xs text-zinc-500 mb-1">notes / issues / feedback</p>
+          <Input value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} /></div>
+        <Btn variant="primary" disabled={busy} onClick={submit}>Log outcome</Btn>
+      </div>
+      <ErrorNote>{err}</ErrorNote>
+      {(cf.outcomes || []).length > 0 && (
+        <Table headers={['date', 'adoption', 'hours/month (actual)', `vs estimate${est ? ` (${est})` : ''}`, 'notes', 'by']}
+          rows={cf.outcomes.slice().reverse().map(o => [o.date?.slice(0, 10),
+            o.adoption_pct != null ? `${o.adoption_pct}%` : '—',
+            o.hours_saved_per_month ?? '—',
+            (o.hours_saved_per_month != null && est)
+              ? <b className={o.hours_saved_per_month >= est ? 'text-emerald-400' : 'text-amber-400'}>
+                  {Math.round(100 * o.hours_saved_per_month / est)}%</b> : '—',
+            o.notes, o.recorded_by])} />)}
+    </Card>
   )
 }
 

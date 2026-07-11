@@ -1,12 +1,27 @@
 import { useEffect, useRef, useState } from 'react'
 
+// Console access token (NOT an LLM/provider key — those never reach the client).
+// Held in sessionStorage so a tab close forgets it.
+export const getToken = () => sessionStorage.getItem('console_token') || ''
+export const setToken = (t) => sessionStorage.setItem('console_token', t)
+export const getOperator = () => localStorage.getItem('operator_name') || ''
+export const setOperator = (n) => localStorage.setItem('operator_name', n)
+// browser-navigation links (downloads, report tabs) can't send headers
+export const tokenQS = () => (getToken() ? `?token=${encodeURIComponent(getToken())}` : '')
+
 export async function api(path, opts = {}) {
+  const headers = opts.body instanceof FormData ? {} : { 'content-type': 'application/json' }
+  if (getToken()) headers['x-console-token'] = getToken()
   const res = await fetch(path, {
-    headers: opts.body instanceof FormData ? {} : { 'content-type': 'application/json' },
     ...opts,
+    headers: { ...headers, ...(opts.headers || {}) },
     body: opts.body instanceof FormData ? opts.body
         : opts.body ? JSON.stringify(opts.body) : undefined,
   })
+  if (res.status === 401) {
+    window.dispatchEvent(new Event('console-auth-required'))
+    throw new Error('unauthorized — supply the console token')
+  }
   if (!res.ok) {
     let detail = res.statusText
     try {

@@ -43,29 +43,57 @@ function ModelPicker({ providers, value, onChange, listId }) {
   )
 }
 
+const INTAKE_FIELDS = [
+  ['problem', 'What is the problem? *', 'What is broken or slow, and what does “good” look like?'],
+  ['context', 'Who has it & how does it work today?', 'Team, current process step by step, hand-offs'],
+  ['volume', 'Volume & time', 'How often, how many items, minutes per item, error rate'],
+  ['tools', 'Tools & data available', 'Systems used today; what data exists, where, how sensitive'],
+  ['constraints', 'Constraints', 'Compliance/security requirements, budget appetite, deadlines, must-stay-human steps'],
+  ['metric', 'Success metric', 'The number that should move, and its current baseline'],
+]
+
 export default function RunsPage() {
   const { data: runs } = usePoll('/runs', 4000)
   const { data: providers } = usePoll('/providers', 30000)
-  const { data: sources } = usePoll('/sources', 30000)
+  const { data: rsources } = usePoll('/research-sources', 30000)
   const { data: flow } = usePoll('/config/flow', 60000)
   const { busy, err, setErr, wrap } = useAsync()
 
-  const [problem, setProblem] = useState('')
+  const [title, setTitle] = useState('')
+  const [intake, setIntake] = useState({})
   const [budget, setBudget] = useState('')
   const [roleCfg, setRoleCfg] = useState({})       // {role: {provider, model, temp}}
   const [perRole, setPerRole] = useState(false)
-  const [srcSel, setSrcSel] = useState(null)       // null = all enabled
+  const [srcSel, setSrcSel] = useState(null)       // null = all registered
   const [dry, setDry] = useState(null)
   const [forecast, setForecast] = useState(null)
 
   const provList = (providers || [])
-  const enabledSources = (sources || []).filter(s => s.enabled)
   const defaults = flow?.roles || {}
+  // the run's selectable source universe = quota-guarded providers + keyless + custom
+  const allSources = rsources ? [
+    ...rsources.providers.map(p => ({ id: p.id, name: p.name, status: p.status })),
+    ...rsources.keyless.map(k => ({ id: k.id, name: k.name, status: 'connected' })),
+    ...rsources.custom.filter(c => c.enabled).map(c => ({ id: c.id, name: c.name, status: 'connected' })),
+  ] : []
+
+  const composedProblem = () => {
+    const parts = []
+    if (intake.problem) parts.push(intake.problem)
+    for (const [key, label] of [['context', 'Who has it / current process'], ['volume', 'Volume & time'],
+                                ['tools', 'Tools & data available'], ['constraints', 'Constraints'],
+                                ['metric', 'Success metric & baseline']])
+      if (intake[key]) parts.push(`${label}: ${intake[key]}`)
+    return parts.join('\n\n')
+  }
 
   const buildBody = () => {
+    const problem = composedProblem()
+    if (!problem.trim()) throw new Error('describe the problem first')
     const lead = roleCfg.lead || {}
     if (!lead.model && !perRole) throw new Error('pick a model (populated from your provider key)')
-    const body = { problem, budget: budget || null, provider: lead.provider || provList[0]?.name || null }
+    const body = { problem, title: title || intake.problem?.slice(0, 80) || '',
+                   budget: budget || null, provider: lead.provider || provList[0]?.name || null }
     if (perRole) {
       body.models = {}; body.temperatures = {}
       for (const r of ROLES) {
@@ -99,74 +127,85 @@ export default function RunsPage() {
 
   const rolesToShow = perRole ? ROLES : ['lead']
   return (
-    <div className="grid lg:grid-cols-[440px_1fr] gap-4">
-      <Card title="New run">
+    <div className="grid lg:grid-cols-[460px_1fr] gap-4">
+      <Card title="New idea">
         {provList.length === 0 && (
           <p className="text-amber-400 text-sm mb-3">No providers configured — add an API key under
             <a className="underline ml-1" href="#/settings/providers">Settings → Providers</a> first.</p>)}
-        <Field label="Business problem"
-               hint="the interview is skipped in server mode — include process, volumes, tools, data">
-          <textarea value={problem} onChange={e => setProblem(e.target.value)} rows={6}
-            className="bg-zinc-950 border border-zinc-700 rounded px-2.5 py-1.5 text-sm w-full focus:outline-none focus:border-sky-600"
-            placeholder="What is broken, for whom, current workflow, volumes, error tolerance…" />
-        </Field>
+        <Field label="Idea title"><Input value={title} onChange={e => setTitle(e.target.value)}
+          placeholder="e.g. Automate invoice triage" /></Field>
+        {INTAKE_FIELDS.map(([key, label, hint]) => (
+          <Field key={key} label={label} hint={hint}>
+            <textarea value={intake[key] || ''} onChange={e => setIntake({ ...intake, [key]: e.target.value })}
+              rows={key === 'problem' ? 3 : 2}
+              className="bg-zinc-950 border border-zinc-700 rounded px-2.5 py-1.5 text-sm w-full focus:outline-none focus:border-sky-600" />
+          </Field>))}
+        <p className="text-[11px] text-zinc-600 mt-1">Anything you leave blank, the discovery agent will
+          ask about — you answer its questions right in the run view.</p>
 
-        <div className="flex items-center justify-between mt-3">
-          <Label>Models <span className="text-zinc-600">(from your validated keys — nothing is pinned)</span></Label>
-          <button className="text-xs text-sky-500 hover:underline" onClick={() => setPerRole(!perRole)}>
-            {perRole ? 'simple: one model' : 'advanced: per-role models'}</button>
-        </div>
-        <div className="space-y-2">
-          {rolesToShow.map(role => (
-            <div key={role}>
-              {perRole && <p className="text-[11px] text-zinc-500 mb-0.5">{role}
-                <span className="text-zinc-700 ml-2">default temp {defaults[role]?.temperature ?? '—'}</span></p>}
-              <ModelPicker providers={provList} listId={`models-${role}`}
-                           value={roleCfg[role] || {}} onChange={v => setRoleCfg({ ...roleCfg, [role]: v })} />
-            </div>
-          ))}
-        </div>
-
-        <Field label="Research budget" hint="wall clock, e.g. 30m / 4h (caps also in research.yaml)">
-          <Input value={budget} onChange={e => setBudget(e.target.value)} placeholder="4h" />
-        </Field>
-
-        <Label>Research sources for this run
-          <span className="text-zinc-600 ml-1">({enabledSources.length} enabled globally)</span></Label>
-        <div className="flex flex-wrap gap-1.5">
-          {enabledSources.map(s => {
-            const on = !srcSel || srcSel.includes(s.id)
-            return <button key={s.id} onClick={() => {
-              const cur = srcSel || enabledSources.map(x => x.id)
-              const next = on ? cur.filter(x => x !== s.id) : [...cur, s.id]
-              setSrcSel(next.length === enabledSources.length ? null : next)
-            }} className={`px-2 py-0.5 rounded text-xs border ${on ? 'border-sky-700 bg-sky-950 text-sky-300' : 'border-zinc-700 text-zinc-500'}`}>
-              {s.name}</button>
-          })}
-        </div>
+        <details className="mt-3">
+          <summary className="text-xs text-sky-500 cursor-pointer">Advanced: models, sources, budget</summary>
+          <div className="flex items-center justify-between mt-3">
+            <Label>Models <span className="text-zinc-600">(from your validated keys — nothing is pinned)</span></Label>
+            <button className="text-xs text-sky-500 hover:underline" onClick={() => setPerRole(!perRole)}>
+              {perRole ? 'simple: one model' : 'per-role models'}</button>
+          </div>
+          <div className="space-y-2">
+            {rolesToShow.map(role => (
+              <div key={role}>
+                {perRole && <p className="text-[11px] text-zinc-500 mb-0.5">{role}
+                  <span className="text-zinc-700 ml-2">default temp {defaults[role]?.temperature ?? '—'}</span></p>}
+                <ModelPicker providers={provList} listId={`models-${role}`}
+                             value={roleCfg[role] || {}} onChange={v => setRoleCfg({ ...roleCfg, [role]: v })} />
+              </div>
+            ))}
+          </div>
+          <Field label="Research budget" hint="wall clock, e.g. 30m / 4h (caps also in research.yaml)">
+            <Input value={budget} onChange={e => setBudget(e.target.value)} placeholder="4h" />
+          </Field>
+          <Label>Research sources for this run <span className="text-zinc-600">(quota-guarded; router picks per worker)</span></Label>
+          <div className="flex flex-wrap gap-1.5">
+            {allSources.map(s => {
+              const on = !srcSel || srcSel.includes(s.id)
+              return <button key={s.id} onClick={() => {
+                const cur = srcSel || allSources.map(x => x.id)
+                const next = on ? cur.filter(x => x !== s.id) : [...cur, s.id]
+                setSrcSel(next.length === allSources.length ? null : next)
+              }} title={s.status}
+                className={`px-2 py-0.5 rounded text-xs border ${on ? 'border-sky-700 bg-sky-950 text-sky-300' : 'border-zinc-700 text-zinc-500'}
+                  ${s.status === 'no_key' ? 'opacity-50' : ''}`}>
+                {s.name}{s.status === 'no_key' ? ' (no key)' : ''}</button>
+            })}
+          </div>
+        </details>
+        {!perRole && !(roleCfg.lead || {}).model && provList.length > 0 &&
+          <p className="text-[11px] text-amber-400 mt-2">Pick a model under Advanced before starting.</p>}
 
         <div className="flex gap-2 mt-4">
-          <Btn variant="primary" disabled={busy || !problem.trim()} onClick={start}>Start run</Btn>
-          <Btn disabled={busy || !problem.trim()} onClick={dryRun}>Dry run / explain plan</Btn>
+          <Btn variant="primary" disabled={busy || !(intake.problem || '').trim()} onClick={start}>Start run</Btn>
+          <Btn disabled={busy || !(intake.problem || '').trim()} onClick={dryRun}>Dry run / explain plan</Btn>
           <Btn disabled={busy} onClick={() => wrap(async () => setForecast(await api('/forecast', { method: 'POST' })))}>
             Quota forecast</Btn>
         </div>
         <ErrorNote>{err}</ErrorNote>
       </Card>
 
-      <Card title={`Runs (${runs?.length ?? '…'})`}>
-        {(runs || []).length === 0 && <p className="text-zinc-600 text-sm">No runs yet. On serverless hosting run
+      <Card title={`Idea portfolio (${runs?.length ?? '…'})`}>
+        {(runs || []).length === 0 && <p className="text-zinc-600 text-sm">No ideas yet. On serverless hosting run
           state is ephemeral — download files as soon as they're ready.</p>}
         <div className="space-y-1.5">
           {(runs || []).map(r => (
             <a key={r.run_id} href={`#/runs/${r.run_id}`}
                className="flex items-center gap-3 px-3 py-2 rounded border border-zinc-800 hover:border-zinc-600 bg-zinc-950/50">
-              <span className="font-mono text-zinc-200">{r.run_id}</span>
+              <span className="text-zinc-100 font-semibold truncate max-w-[220px]">{r.title || r.run_id}</span>
               <Pill kind={statusKind(r.status)}>{r.status.slice(0, 40)}</Pill>
-              {r.awaiting_gate && <span className="text-amber-400 text-xs">needs approval</span>}
+              {r.awaiting_gate && <span className="text-amber-400 text-xs">
+                {r.open_questions_count ? `${r.open_questions_count} questions for you` : 'needs approval'}</span>}
               <span className="text-zinc-500 text-xs truncate flex-1">{r.problem}</span>
-              {r.verdict && <span className="text-emerald-400 text-xs font-semibold">{r.verdict}</span>}
-              <span className="text-zinc-500 text-xs">{r.findings}f · {r.options}o · {fmtUsd(r.cost_spent_usd)}</span>
+              {r.decision && <span className="text-emerald-400 text-xs font-bold uppercase">{r.decision}
+                {r.recommended_option ? ` · ${r.recommended_option}` : ''}</span>}
+              {!r.decision && r.verdict && <span className="text-emerald-500 text-xs">{r.verdict}</span>}
+              <span className="text-zinc-500 text-xs">{r.findings}f · {fmtUsd(r.cost_spent_usd)}</span>
               <span className="text-zinc-600 text-xs w-16 text-right">{ago(r.updated_at)}</span>
             </a>
           ))}

@@ -108,7 +108,15 @@ class RouterSession:
         self.quota = QuotaManager()
         self.cache = Cache()
         self.seen_queries: set = set()
+        # per-run source selection (run form). None = everything registered.
+        # 'builtin' (the keyless final read fallback) is never filtered out —
+        # a run must always be able to read a static page.
+        sel = getattr(ctx, "sources", None)
+        self.allowed = set(sel) | {"builtin"} if sel else None
         self._lock = threading.Lock()
+
+    def _permitted(self, chain: List[str]) -> List[str]:
+        return [p for p in chain if self.allowed is None or p in self.allowed]
         if research_cfg:
             try:
                 self.quota.reserve(self.run_id or "adhoc", self.quota.estimate_run(research_cfg))
@@ -137,7 +145,7 @@ class RouterSession:
             self.seen_queries.add(norm)
 
         chain = ([force_provider] if force_provider else
-                 SEARCH_ROUTES.get(worker, SEARCH_ROUTES["low_code"]))
+                 self._permitted(SEARCH_ROUTES.get(worker, SEARCH_ROUTES["low_code"])))
         merged: Dict[str, dict] = {}
         fallback_from = ""
         for provider in chain:
@@ -151,7 +159,7 @@ class RouterSession:
                 break
         # community evidence rides along (never the sole basis — weighted 0.4)
         if not force_provider:
-            for provider in EVIDENCE_ROUTES.get(worker, []):
+            for provider in self._permitted(EVIDENCE_ROUTES.get(worker, [])):
                 got = self._search_one(provider, query, max(2, n // 3), "")
                 for r in got or []:
                     merged.setdefault(r["url"], r)
@@ -199,7 +207,7 @@ class RouterSession:
                        url=url, cache="hit", units=0, chars=len(cached), status="ok")
             return cached
         chain = ([force_provider] if force_provider else
-                 READ_ROUTES.get(worker, READ_ROUTES["default"]))
+                 self._permitted(READ_ROUTES.get(worker, READ_ROUTES["default"])))
         fallback_from = ""
         for provider in chain:
             fn = READ_ADAPTERS.get(provider)
@@ -231,6 +239,8 @@ class RouterSession:
 
     def extract_structured(self, url: str, instruction: str) -> str:
         """TinyFish, only when structured extraction is actually needed (saas pricing)."""
+        if self.allowed is not None and "tinyfish" not in self.allowed:
+            return ""
         started = time.monotonic()
         try:
             self.quota.preflight("tinyfish", 1, self.run_id)
