@@ -194,17 +194,21 @@ def list_models(provider: Optional[str] = None) -> List[str]:
 
 
 def test_provider(provider: str) -> Dict[str, Any]:
-    """Cheap live validation: try list-models; fall back to a 1-token completion."""
+    """Cheap live validation: try list-models; fall back to a 1-token completion
+    only when the endpoint simply doesn't exist (auth failures report directly)."""
     try:
         models = list_models(provider)
         return {"ok": True, "detail": f"key valid — {len(models)} models visible", "models": models}
     except LLMError as e:
-        if "list-models failed" not in str(e):
-            return {"ok": False, "detail": str(e), "models": []}
+        err = str(e)
+        no_endpoint = ("list-models failed" in err
+                       and any(f"HTTP {c}" in err for c in (404, 405, 501)))
+        if not no_endpoint:
+            return {"ok": False, "detail": err, "models": []}
     # endpoint without /models (some local servers): try a minimal completion
     try:
         llm("ping", role="classify", provider=provider,
-            model=run_config().get("models", {}).get("classify") or "test")
+            model=(run_config().get("models") or {}).get("classify") or "test")
         return {"ok": True, "detail": "key valid (no list-models endpoint — "
                                       "enter model ids manually)", "models": []}
     except Exception as e:  # noqa: BLE001 — reporting, not handling
