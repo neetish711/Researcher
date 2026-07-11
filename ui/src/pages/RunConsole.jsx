@@ -10,10 +10,52 @@ const GATE_LABEL = {
   approve_plan: 'Approve the research plan (workers only run after this)',
 }
 const EVENT_ICON = {
-  llm_call: '🧠', search_query: '🔎', page_fetch: '🌐', doc_read: '📄', finding_created: '📌',
-  citation_verified: '✅', citation_rejected: '🚫', round_complete: '🔁', gate_waiting: '⏸',
-  gate_approved: '👍', gate_rejected: '👎', error: '❌', retry: '↩', checkpoint_saved: '💾',
-  agent_start: '▶', agent_end: '⏹', worker_start: '👷', worker_end: '🏁', run_created: '✨', tool_call: '🔧',
+  llm_call: '🧠', search_query: '🔎', source_call: '📡', page_fetch: '🌐', doc_read: '📄',
+  finding_created: '📌', citation_verified: '✅', citation_rejected: '🚫', round_complete: '🔁',
+  gate_waiting: '⏸', gate_approved: '👍', gate_rejected: '👎', error: '❌', retry: '↩',
+  checkpoint_saved: '💾', agent_start: '▶', agent_end: '⏹', worker_start: '👷', worker_end: '🏁',
+  run_created: '✨', tool_call: '🔧',
+}
+
+/** live per-provider quota burn during a run */
+function QuotaStrip({ visible }) {
+  const { data } = usePoll(visible ? '/research-sources' : null, 6000)
+  if (!visible || !data) return null
+  const active = data.providers.filter(p => p.quota?.monthly_quota != null && (p.has_key || p.keyless_ok))
+  if (!active.length) return null
+  return (
+    <div className="bg-zinc-900 border border-zinc-800 rounded-lg px-4 py-2 flex flex-wrap gap-x-6 gap-y-1">
+      <span className="text-[10px] uppercase tracking-widest text-zinc-500 self-center">source quota</span>
+      {active.map(p => {
+        const q = p.quota, pct = Math.min(100, 100 * q.used / q.monthly_quota)
+        return (
+          <div key={p.id} className="text-xs min-w-[130px]">
+            <span className="font-mono text-zinc-300">{p.id}</span>
+            <span className={`ml-1 ${p.status === 'exhausted' ? 'text-red-400' : p.status === 'quota_low' ? 'text-amber-400' : 'text-zinc-500'}`}>
+              {q.used.toLocaleString()}/{q.monthly_quota.toLocaleString()} {q.unit}s</span>
+            <div className="h-1 bg-zinc-800 rounded mt-0.5">
+              <div className={`h-1 rounded ${pct > 85 ? 'bg-red-500' : pct > 60 ? 'bg-amber-500' : 'bg-emerald-600'}`}
+                   style={{ width: `${pct}%` }} /></div>
+          </div>)
+      })}
+      {!data.free_tier_only && <span className="text-red-400 text-xs self-center">⚠ free_tier_only OFF</span>}
+    </div>
+  )
+}
+
+/** end-of-run per-provider usage: calls, cache hit rate, units, findings contributed */
+function SourceUsage({ runId }) {
+  const { data } = usePoll(`/runs/${runId}/source-usage`, 15000)
+  if (!data || !Object.keys(data.providers || {}).length) return null
+  return (
+    <Card title={`Source usage — ${data.total_calls} calls · cache hit rate ${(data.cache_hit_rate * 100).toFixed(0)}%`}>
+      <Table headers={['provider', 'calls', 'errors', 'cache hits', 'units spent', 'findings contributed']}
+        rows={Object.entries(data.providers).sort((a, b) => b[1].calls - a[1].calls).map(([p, c]) => [
+          <span className="font-mono">{p}</span>, c.calls, c.errors || '—', c.cache_hits,
+          c.units ? c.units.toLocaleString() : '0', c.findings || '—'])} />
+      <p className="text-[11px] text-zinc-600 mt-1">Jina should carry the bulk of extraction; Firecrawl/TinyFish only on their trigger conditions.</p>
+    </Card>
+  )
 }
 
 function agentStates(cf, status) {
@@ -303,6 +345,7 @@ export default function RunConsole({ runId }) {
       </Card>
 
       <MetricsStrip m={metrics} cf={cf} />
+      <QuotaStrip visible={sm.status.startsWith('running') || sm.status.startsWith('awaiting')} />
 
       {gate && (
         <div className="border border-amber-600 bg-amber-950/30 rounded-lg p-4">
@@ -371,6 +414,7 @@ export default function RunConsole({ runId }) {
                 <p className="text-red-200/80 mt-1 break-words">{e.error}</p>
                 {e.suggested_fix && <p className="text-zinc-400 text-xs mt-1">fix: {e.suggested_fix}</p>}
                 {e.impact && <p className="text-zinc-500 text-xs">impact: {e.impact}</p>}
+                {e.type === 'source_call' && <SourceCallRetry runId={runId} e={e} />}
               </div>))}
           </div>
         </Card>
@@ -387,7 +431,9 @@ export default function RunConsole({ runId }) {
           <Card title={`Tool landscape (${allOptions.length} options)`}>
             <Table headers={['option', 'category', 'similarity', 'matched/missing', 'build $ est', 'monthly $ est', 'fit', 'exists?', 'sources']}
               rows={allOptions.sort((a, b) => (b.similarity?.index || 0) - (a.similarity?.index || 0)).map(o => [
-                <a className="text-sky-400 hover:underline" href={o.url} target="_blank" rel="noreferrer">{o.name}</a>,
+                <span><a className="text-sky-400 hover:underline" href={o.url} target="_blank" rel="noreferrer">{o.name}</a>
+                  {o.vendor_only && <span className="block text-amber-400 text-[10px]">⚑ vendor, unverified</span>}
+                  {o.community_only && <span className="block text-red-400 text-[10px]">⚑ anecdote-only evidence</span>}</span>,
                 o.cat, `${o.similarity?.index ?? 0}/100`,
                 `${o.similarity?.matched?.length || 0}/${o.similarity?.missing?.length || 0}`,
                 `${Math.round(o.costs?.build_cost_usd_low || 0)}–${Math.round(o.costs?.build_cost_usd_high || 0)}`,
@@ -405,6 +451,7 @@ export default function RunConsole({ runId }) {
                 <a className="text-sky-400 hover:underline break-all" href={f.source.url} target="_blank" rel="noreferrer">{f.source.title || f.source.url}</a>,
                 f.source.verified ? '✅' : '—'])} />
           </Card>
+          <SourceUsage runId={runId} />
           <Card title={`Rejected by citation check (${rejectedFindings.length})`}>
             <Table headers={['finding', 'url', 'action', 'reason']} empty="nothing rejected"
               rows={rejectedFindings.map(e => [
@@ -464,6 +511,33 @@ export default function RunConsole({ runId }) {
       {detail && <EventDetail e={detail} onClose={() => setDetail(null)}
         onRetry={(sm.status.startsWith('error') || sm.status === 'paused_budget') ? () => { setDetail(null); setRetry(true) } : null} />}
       {retry && <RetryModal runId={runId} providers={providers || []} onClose={() => setRetry(false)} onDone={() => setErr(null)} />}
+    </div>
+  )
+}
+
+/** one-click retry of a failed source call, optionally forcing a different provider */
+function SourceCallRetry({ runId, e }) {
+  const [provider, setProvider] = useState('')
+  const [result, setResult] = useState(null)
+  const { busy, err, wrap } = useAsync()
+  const providers = e.endpoint === 'read'
+    ? ['jina', 'firecrawl', 'builtin']
+    : ['tavily', 'zenserp', 'wikipedia', 'github', 'openalex', 'ddg_web', 'algolia_hn']
+  const go = () => wrap(async () => {
+    const body = { worker: e.worker || 'low_code', force_provider: provider || null }
+    if (e.endpoint === 'read') body.url = e.url; else body.query = e.query || e.url
+    setResult(await api(`/runs/${runId}/source-retry`, { method: 'POST', body }))
+  })
+  return (
+    <div className="flex items-center gap-2 mt-2 text-xs">
+      <Select className="!w-40 !py-1" value={provider} onChange={ev => setProvider(ev.target.value)}>
+        <option value="">same chain</option>
+        {providers.filter(p => p !== e.provider).map(p => <option key={p} value={p}>force {p}</option>)}
+      </Select>
+      <Btn className="!py-0.5 !px-2 text-xs" disabled={busy} onClick={go}>Retry this call</Btn>
+      {result && <span className={result.ok ? 'text-emerald-400' : 'text-red-400'}>
+        {result.ok ? `✓ ok${result.chars ? ` (${result.chars} chars, cached for the agent)` : ` (${result.results?.length ?? 0} results)`}` : '✗ still failing'}</span>}
+      <ErrorNote>{err}</ErrorNote>
     </div>
   )
 }

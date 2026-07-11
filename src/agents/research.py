@@ -26,8 +26,9 @@ from src.state.casefile import (CaseFile, CostEstimate, Finding, ResearchPlan,
 from src.tools.costs import BudgetExceeded, Deadline
 from src.tools.models import (CONFIG_DIR, RunContext, llm_json, load_prompt, load_yaml)
 from src.tools.reports import render_html, render_ppt
-from src.tools.search import check_url, fetch_page, is_denied, rate_reliability
-from src.server.sources import TIER_TO_RELIABILITY, multi_search
+from src.tools.search import check_url, is_denied, rate_reliability
+from src.server.router import RouterSession
+from src.server.sources import TIER_TO_RELIABILITY, list_sources, multi_search
 
 PAGE_CHARS_PER_EXTRACTION = 6000
 PAGES_PER_EXTRACTION_CALL = 4
@@ -95,21 +96,36 @@ def _generate_queries(category: str, description: str, plan: ResearchPlan,
     return queries[: q.get("max_queries_per_round", 12)]
 
 
-def _gather_pages(queries: List[str], cfg: dict, budget_left: List[int],
+def _custom_source_ids(ctx: RunContext) -> List[str]:
+    """User-registered custom sources (Settings → Research Sources) join every worker."""
+    try:
+        return [s["id"] for s in list_sources()
+                if not s.get("builtin") and s.get("enabled")
+                and (ctx.sources is None or s["id"] in ctx.sources)]
+    except Exception:
+        return []
+
+
+def _gather_pages(category: str, queries: List[str], cfg: dict, budget_left: List[int],
                   ctx: RunContext) -> List[dict]:
-    """Search all registered sources, then fetch full pages, best-first by reliability."""
+    """Search via the router (curated per-worker chains, quota-guarded, cached),
+    then read full pages via the extractor chain (Jina → Firecrawl → builtin)."""
+    router: RouterSession = ctx.router
     q = cfg.get("queries") or {}
     sources_cfg = cfg.get("sources") or {}
+    custom_ids = _custom_source_ids(ctx)
     hits: Dict[str, dict] = {}
     for query in queries:
         if budget_left[0] <= 0:
             break
         budget_left[0] -= 1  # a search is a tool call
-        for h in multi_search(query, n_per_source=q.get("results_per_query", 6),
-                              only=ctx.sources, events=ctx.events):
+        found = router.search(category, query, n=q.get("results_per_query", 6))
+        if custom_ids:  # user-registered APIs ride along for every worker
+            found += multi_search(query, n_per_source=3, only=custom_ids, events=ctx.events)
+        for h in found:
             url = h["url"]
             if url not in hits and not is_denied(url, sources_cfg):
-                # a source's registry tier is a floor; official-docs URLs still rank high
+                # tier floor from the source registry; official-docs URLs still rank high
                 by_url = rate_reliability(url, sources_cfg)
                 by_tier = TIER_TO_RELIABILITY.get(h.get("tier", ""), "low")
                 order = {"high": 0, "medium": 1, "low": 2}
@@ -121,14 +137,16 @@ def _gather_pages(queries: List[str], cfg: dict, budget_left: List[int],
     for h in ranked:
         if budget_left[0] <= 0:
             break
-        budget_left[0] -= 1  # a fetch is a tool call
-        text = fetch_page(h["url"])
-        ctx.emit("page_fetch", agent="research", url=h["url"],
-                 status="ok" if text else "error", chars=len(text),
-                 error="" if text else "empty or unreachable")
+        budget_left[0] -= 1  # a read is a tool call
+        text = router.read(category, h["url"])
+        if text and category == "saas" and any(k in h["url"].lower() for k in ("pricing", "plans")):
+            structured = router.extract_structured(h["url"], "extract the pricing table and tiers")
+            if structured:
+                text = f"{text}\n\nSTRUCTURED PRICING EXTRACTION:\n{structured}"
         if text:
             pages.append({"url": h["url"], "title": h["title"],
-                          "reliability": h["reliability"], "text": text})
+                          "reliability": h["reliability"], "tier": h.get("tier", ""),
+                          "text": text})
     return pages
 
 
@@ -172,7 +190,7 @@ def _worker_round(category: str, description: str, plan: ResearchPlan, cfg: dict
     ctx.emit("worker_start", agent="research", worker=category, round=round_no)
     budget_left = [int((cfg.get("budget") or {}).get("max_tool_calls_per_worker", 40))]
     queries = _generate_queries(category, description, plan, cfg, focus, ctx)
-    pages = _gather_pages(queries, cfg, budget_left, ctx)
+    pages = _gather_pages(category, queries, cfg, budget_left, ctx)
     if round_no == 1:
         pages = _uploaded_docs(ctx) + pages  # staged internal docs feed round 1
     print(f"  [worker:{category}] {len(queries)} queries → {len(pages)} pages read "
@@ -325,10 +343,14 @@ def _coverage_met(case: CaseFile, cfg: dict) -> bool:
 
 def _verify_citations(case: CaseFile, ctx: RunContext) -> None:
     print(f"[verify] checking {len(case.findings)} citations for reachability…")
+    from src.server.router import Cache
+    cache = Cache()
 
     def _check(f: Finding) -> bool:
         if f.source.url.startswith("internal://"):
             return True  # user-staged internal doc — reachable by construction
+        if cache.get_page(f.source.url):
+            return True  # we fetched and cached it this run — reachable by construction
         return check_url(f.source.url)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -361,6 +383,72 @@ def _verify_citations(case: CaseFile, ctx: RunContext) -> None:
         for o in opts:
             o.finding_ids = [fid for fid in o.finding_ids if fid in valid]
     print(f"[verify] verified {len(kept) - demoted}, demoted {demoted}, dropped {dropped}")
+
+    _claim_support_pass(case, ctx, cache)
+    _sole_support_flags(case, ctx)
+
+
+def _claim_support_pass(case: CaseFile, ctx: RunContext, cache) -> None:
+    """Re-read each cited page (from cache — zero quota) and confirm it actually
+    supports the claim. Unsupported → demoted to assumption + logged as rejected."""
+    checkable = [(f, cache.get_page(f.source.url)) for f in case.findings
+                 if f.source.verified and not f.source.url.startswith("internal://")]
+    checkable = [(f, text) for f, text in checkable if text]
+    if not checkable:
+        return
+    print(f"[verify] claim-support check on {len(checkable)} cached citations…")
+    for i in range(0, len(checkable), 8):
+        batch = checkable[i:i + 8]
+        payload = json.dumps([{"id": f.id, "claim": f.claim,
+                               "page_excerpt": text[:2500]} for f, text in batch])
+        try:
+            data = llm_json(
+                prompt=payload, role="classify", ctx=ctx, purpose="citation claim-support",
+                system=("For each item decide if the page excerpt actually supports the claim. "
+                        "Paraphrase counts; absence or contradiction does not. Output strict "
+                        'JSON: {"verdicts": [{"id": "F-1", "supported": true}]}'))
+        except Exception as e:  # noqa: BLE001 — verification must not kill the run
+            ctx.emit("error", agent="research", error=f"claim-support batch failed: {e}",
+                     recovered=True, impact="these findings keep reachability-only verification")
+            continue
+        verdicts = {v.get("id"): bool(v.get("supported")) for v in data.get("verdicts", [])}
+        for f, _text in batch:
+            if verdicts.get(f.id) is False:
+                f.kind = "assumption"
+                f.confidence = min(f.confidence, 0.2)
+                f.source.verified = False
+                q = f"Rejected by citation check: source did not support “{f.claim[:120]}”"
+                if q not in case.open_questions:
+                    case.open_questions.append(q)
+                ctx.emit("citation_rejected", agent="research", finding_id=f.id,
+                         url=f.source.url, action="demoted to assumption",
+                         reason="cached page does not support the claim")
+
+
+def _sole_support_flags(case: CaseFile, ctx: RunContext) -> None:
+    """No single vendor page may be the sole support for an option; community
+    sources (weight 0.4) can never be the sole basis for a recommendation."""
+    by_option: Dict[str, List[Finding]] = {}
+    for f in case.findings:
+        if f.option:
+            by_option.setdefault(f.option.lower(), []).append(f)
+    for opts in case.tool_landscape.values():
+        for o in opts:
+            fs = by_option.get(o.name.lower(), []) + \
+                 [f for f in case.findings if f.id in o.finding_ids]
+            fs = list({f.id: f for f in fs}.values())
+            if not fs:
+                continue
+            if all(f.vendor_claim for f in fs):
+                o.vendor_only = True
+                ctx.emit("citation_rejected", agent="research", finding_id="",
+                         url=o.url, action=f"option '{o.name}' flagged vendor-only",
+                         reason="every supporting source is the vendor — needs one independent source")
+            if all(f.source.source_type == "community" for f in fs):
+                o.community_only = True
+                ctx.emit("citation_rejected", agent="research", finding_id="",
+                         url=o.url, action=f"option '{o.name}' flagged community-only",
+                         reason="anecdote-only evidence (weight 0.4) cannot be the sole basis")
 
 
 # ── the loop ─────────────────────────────────────────────────────────────────
@@ -402,6 +490,36 @@ def run(case: CaseFile, ctx: RunContext, budget: Optional[str] = None) -> CaseFi
     max_workers = int(bcfg.get("max_workers", 4))
     gaps: List[str] = []
 
+    # one router per run: quota pre-flight, cache, dedup, curated per-worker chains.
+    # Reserves this run's estimated source calls so parallel runs can't jointly
+    # blow a free tier; released in the finally below.
+    ctx.router = RouterSession(ctx, research_cfg=cfg)
+
+    try:
+        _research_loop(case, ctx, cfg, plan, deadline, gaps,
+                       max_rounds=max_rounds, min_rounds=min_rounds,
+                       max_workers=max_workers, categories=categories)
+    finally:
+        ctx.router.release()
+
+    _verify_citations(case, ctx)
+
+    out = cfg.get("outputs") or {}
+    reports_dir = ctx.run_dir
+    html = render_html(case, reports_dir / out.get("html", "reports/detailed_analysis.html"))
+    print(f"[reports] {html}")
+    ppt = render_ppt(case, reports_dir / out.get("ppt", "reports/overview.pptx"))
+    if ppt:
+        print(f"[reports] {ppt}")
+
+    case.status = "in_progress"
+    case.next_agent = "suitability"
+    return case
+
+
+def _research_loop(case: CaseFile, ctx: RunContext, cfg: dict, plan: ResearchPlan,
+                   deadline: Deadline, gaps: List[str], *, max_rounds: int,
+                   min_rounds: int, max_workers: int, categories: Dict[str, str]) -> None:
     while case.research_rounds_done < max_rounds:
         deadline.check()
         rnd = case.research_rounds_done + 1
@@ -444,20 +562,6 @@ def run(case: CaseFile, ctx: RunContext, budget: Optional[str] = None) -> CaseFi
         if deadline.expired():
             print("[research] wall clock exhausted — exiting with what we have")
             break
-
-    _verify_citations(case, ctx)
-
-    out = cfg.get("outputs") or {}
-    reports_dir = ctx.run_dir
-    html = render_html(case, reports_dir / out.get("html", "reports/detailed_analysis.html"))
-    print(f"[reports] {html}")
-    ppt = render_ppt(case, reports_dir / out.get("ppt", "reports/overview.pptx"))
-    if ppt:
-        print(f"[reports] {ppt}")
-
-    case.status = "in_progress"
-    case.next_agent = "suitability"
-    return case
 
 
 def main() -> None:

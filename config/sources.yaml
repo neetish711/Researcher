@@ -1,0 +1,91 @@
+# config/sources.yaml — research providers: env-var NAMES + limits only. NO KEYS HERE.
+# Keys are entered once through the UI (Settings → Research Sources) into the
+# server-side vault, or set as environment variables — never in this repo.
+
+free_tier_only: true          # hard block on any call that could bill (default ON)
+
+providers:
+  tavily:
+    name: Tavily
+    key_env: TAVILY_API_KEY
+    role: "LLM-clean search — primary retrieval for all workers"
+    monthly_quota: 1000           # credits — verify on the pricing page (limits change)
+    unit: credit
+    rate_limit: { rps: 1, rpm: 30 }
+    allowed_endpoints: [search]   # /research is BLOCKED at the adapter (~250 credits/call)
+    search_depth: basic           # basic only — advanced costs 2 credits
+    reliability: secondary
+    pricing_url: https://www.tavily.com/pricing
+
+  zenserp:
+    name: Zenserp
+    key_env: ZENSERP_API_KEY
+    role: "SERP results — broad discovery, competitor/alternative lookups"
+    monthly_quota: null           # unknown — assumed_quota enforced until verified
+    assumed_quota: 50
+    unit: query
+    rate_limit: { rps: 1, rpm: 30 }
+    reliability: secondary
+    pricing_url: https://zenserp.com/pricing
+
+  firecrawl:
+    name: Firecrawl
+    key_env: FIRECRAWL_API_KEY
+    role: "Search + full-page scrape; JS-heavy sites (reserved: Jina does the bulk)"
+    monthly_quota: 1000
+    unit: credit
+    rate_limit: { rps: 1, rpm: 20 }
+    use_when: jina_failed_or_js_heavy
+    reliability: secondary
+    pricing_url: https://www.firecrawl.dev/pricing
+
+  jina:
+    name: Jina Reader
+    key_env: JINA_API_KEY
+    role: "PRIMARY doc reader — URL → clean markdown (largest free tier)"
+    monthly_quota: 1000000
+    unit: token
+    rate_limit: { rps: 2, rpm: 60 }
+    default_extractor: true
+    reliability: secondary
+    pricing_url: https://jina.ai/reader
+
+  tinyfish:
+    name: TinyFish
+    key_env: TINYFISH_API_KEY
+    base_url_env: TINYFISH_BASE_URL   # agentic extraction API; base URL configurable
+    role: "Agentic structured extraction (pricing tables) — saas worker only"
+    monthly_quota: null
+    assumed_quota: 50
+    unit: request
+    rate_limit: { rps: 1, rpm: 20 }
+    use_when: structured_extraction_needed
+    reliability: secondary
+    pricing_url: https://tinyfish.ai
+
+  algolia_hn:
+    name: Hacker News (Algolia)
+    key_env: ALGOLIA_API_KEY          # optional — the public HN index needs no key
+    role: "Practitioner gotchas + real-world experience. Anecdote, not evidence."
+    monthly_quota: 10000
+    unit: query
+    rate_limit: { rps: 2, rpm: 60 }
+    reliability: community            # weight 0.4 — can never be sole basis
+    keyless_ok: true
+    pricing_url: https://hn.algolia.com/api
+
+keyless:                              # always on: free, no quota risk, best citations
+  - { id: openalex,         name: OpenAlex,          reliability: primary,  mailto: true }
+  - { id: crossref,         name: Crossref,          reliability: primary,  mailto: true }
+  - { id: arxiv,            name: arXiv,             reliability: primary }
+  - { id: semantic_scholar, name: Semantic Scholar,  reliability: primary }
+  - { id: github,           name: GitHub API,        reliability: primary }
+  - { id: pypi,             name: PyPI,              reliability: primary }
+  - { id: npm,              name: npm registry,      reliability: primary }
+  - { id: wikipedia,        name: Wikipedia,         reliability: secondary }
+  - { id: ddg_web,          name: DuckDuckGo,        reliability: secondary }  # final search fallback
+
+weights: { primary: 1.0, secondary: 0.7, vendor: 0.5, community: 0.4 }
+
+# polite-pool contact for OpenAlex/Crossref (env var name, not a secret)
+mailto_env: CONTACT_EMAIL

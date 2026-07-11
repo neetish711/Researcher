@@ -56,6 +56,7 @@ export default function RunsPage() {
   const [perRole, setPerRole] = useState(false)
   const [srcSel, setSrcSel] = useState(null)       // null = all enabled
   const [dry, setDry] = useState(null)
+  const [forecast, setForecast] = useState(null)
 
   const provList = (providers || [])
   const enabledSources = (sources || []).filter(s => s.enabled)
@@ -147,6 +148,8 @@ export default function RunsPage() {
         <div className="flex gap-2 mt-4">
           <Btn variant="primary" disabled={busy || !problem.trim()} onClick={start}>Start run</Btn>
           <Btn disabled={busy || !problem.trim()} onClick={dryRun}>Dry run / explain plan</Btn>
+          <Btn disabled={busy} onClick={() => wrap(async () => setForecast(await api('/forecast', { method: 'POST' })))}>
+            Quota forecast</Btn>
         </div>
         <ErrorNote>{err}</ErrorNote>
       </Card>
@@ -169,6 +172,29 @@ export default function RunsPage() {
           ))}
         </div>
       </Card>
+
+      {forecast && (
+        <Modal title="Pre-run quota forecast — estimated source calls vs remaining free tier" onClose={() => setForecast(null)} wide>
+          <table className="w-full text-sm">
+            <thead><tr className="text-[11px] uppercase text-zinc-500 text-left">
+              <th className="px-2 py-1">provider</th><th>estimated (upper bound)</th><th>remaining</th>
+              <th>monthly cap</th><th>resets</th><th></th></tr></thead>
+            <tbody>{forecast.providers.map(r => (
+              <tr key={r.provider} className={`border-t border-zinc-800 ${r.would_exceed ? 'bg-red-950/40' : ''}`}>
+                <td className="px-2 py-1.5 font-mono">{r.provider}</td>
+                <td>{r.estimated_units.toLocaleString()} {r.unit}s</td>
+                <td>{r.remaining == null ? '∞' : r.remaining.toLocaleString()}</td>
+                <td>{r.monthly_quota == null ? '—' : r.monthly_quota.toLocaleString()}{r.assumed ? ' (assumed)' : ''}</td>
+                <td className="text-zinc-500">{r.resets_on}</td>
+                <td>{r.would_exceed && <b className="text-red-400">⚑ would exceed free tier</b>}</td>
+              </tr>))}</tbody>
+          </table>
+          {forecast.would_exceed.length > 0
+            ? <p className="text-amber-300 text-sm mt-3">⚠ {forecast.suggestion}</p>
+            : <p className="text-emerald-400 text-sm mt-3">✓ fits inside every free tier{forecast.free_tier_only ? ' (and free_tier_only would refuse any breach pre-flight anyway)' : ''}</p>}
+          <p className="text-[11px] text-zinc-600 mt-1">{forecast.note}</p>
+        </Modal>
+      )}
 
       {dry && (
         <Modal title="Dry run — what this flow WOULD do (nothing executed)" onClose={() => setDry(null)} wide>

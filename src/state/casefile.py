@@ -124,6 +124,8 @@ class ToolOption(BaseModel):
     similarity: SimilarityResult = Field(default_factory=SimilarityResult)
     costs: CostEstimate = Field(default_factory=CostEstimate)
     finding_ids: List[str] = Field(default_factory=list)
+    vendor_only: bool = False      # sole support is the vendor — "vendor, unverified"
+    community_only: bool = False   # anecdote-only evidence — never a sole basis
 
 
 class ResearchPlan(BaseModel):

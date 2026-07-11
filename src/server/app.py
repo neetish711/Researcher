@@ -804,6 +804,172 @@ def download_file(run_id: str, name: str) -> FileResponse:
     return FileResponse(str(path), media_type=media, filename=download_name)
 
 
+# ── research providers: quota-guarded source integrations ───────────────────
+
+from src.server import adapters as adapters_mod
+from src.server.quota import QuotaManager, set_free_tier_only, sources_config
+from src.server.router import Cache, RouterSession, usage_summary
+
+
+class KeyIn(BaseModel):
+    api_key: str
+
+
+class SourceRetryIn(BaseModel):
+    worker: str = "low_code"
+    query: Optional[str] = None
+    url: Optional[str] = None
+    force_provider: Optional[str] = None
+
+
+@app.get("/research-sources")
+def research_sources() -> dict:
+    cfg = sources_config()
+    qm = QuotaManager()
+    cards = []
+    for pid, pc in (cfg.get("providers") or {}).items():
+        st = qm.status(pid)
+        has_key = bool(adapters_mod.get_key(pid))
+        fp = credstore.source_secret_fingerprint(pid) or \
+            (f"env:{pc.get('key_env')}" if os.environ.get(pc.get("key_env", "") or "") else "")
+        if not has_key and not pc.get("keyless_ok"):
+            status = "no_key"
+        elif st["remaining"] is not None and st["remaining"] <= 0:
+            status = "exhausted"
+        elif (st["remaining"] is not None and st["monthly_quota"]
+              and st["remaining"] < 0.15 * st["monthly_quota"]):
+            status = "quota_low"
+        else:
+            status = "connected" if has_key or pc.get("keyless_ok") else "no_key"
+        cards.append({"id": pid, "name": pc.get("name", pid), "role": pc.get("role", ""),
+                      "key_env": pc.get("key_env", ""), "pricing_url": pc.get("pricing_url", ""),
+                      "reliability": pc.get("reliability", "secondary"),
+                      "rate_limit": pc.get("rate_limit", {}), "use_when": pc.get("use_when", ""),
+                      "allowed_endpoints": pc.get("allowed_endpoints"),
+                      "keyless_ok": bool(pc.get("keyless_ok")),
+                      "has_key": has_key, "key_fingerprint": fp,
+                      "status": status, "quota": st})
+    return {"free_tier_only": qm.free_tier_only,
+            "providers": cards,
+            "keyless": cfg.get("keyless") or [],
+            "custom": [s for s in source_registry.list_sources() if not s.get("builtin")],
+            "weights": cfg.get("weights") or {}}
+
+
+@app.post("/research-sources/{pid}/key")
+def research_source_key(pid: str, body: KeyIn) -> dict:
+    if pid not in (sources_config().get("providers") or {}):
+        raise HTTPException(404, f"unknown provider {pid!r}")
+    if not body.api_key.strip():
+        raise HTTPException(422, "api_key must be non-empty")
+    fp = credstore.save_source_secret(pid, body.api_key.strip())
+    return {"provider": pid, "key_fingerprint": fp}   # fingerprint only — never the key
+
+
+@app.delete("/research-sources/{pid}/key")
+def research_source_key_delete(pid: str) -> dict:
+    credstore.delete_source_secret(pid)
+    return {"provider": pid, "deleted": True}
+
+
+@app.post("/research-sources/{pid}/test")
+def research_source_test(pid: str) -> dict:
+    """One cheap live call through the quota gate; success marks the quota row verified."""
+    cfg = (sources_config().get("providers") or {}).get(pid)
+    if cfg is None:
+        raise HTTPException(404, f"unknown provider {pid!r}")
+    qm = QuotaManager()
+    try:
+        qm.preflight(pid, 1)
+        qm.throttle(pid)
+        if pid == "jina":
+            out = adapters_mod.jina_read("https://example.com/")
+            detail = f"read ok — {out['units']} tokens for example.com"
+        elif pid == "firecrawl":
+            out = adapters_mod.firecrawl_read("https://example.com/")
+            detail = "scrape ok (1 credit consumed)"
+        elif pid == "tinyfish":
+            out = adapters_mod.tinyfish_extract("https://example.com/", "extract the page title")
+            detail = "extraction ok (1 request consumed)"
+        elif pid == "tavily":
+            out = adapters_mod.tavily_search("workflow automation", 2)
+            detail = f"search ok — {len(out['results'])} results (1 credit, depth=basic)"
+        elif pid == "zenserp":
+            out = adapters_mod.zenserp_search("workflow automation", 2)
+            detail = f"search ok — {len(out['results'])} results (1 query)"
+        elif pid == "algolia_hn":
+            out = adapters_mod.algolia_hn_search("automation", 2)
+            detail = f"search ok — {len(out['results'])} results (keyless public index)"
+        else:
+            raise HTTPException(404, f"no test for {pid!r}")
+        qm.consume(pid, out.get("units", 1))
+        qm.mark_verified(pid, detail)
+        return {"ok": True, "detail": credstore.redact(detail), "quota": qm.status(pid),
+                "pricing_url": cfg.get("pricing_url", ""),
+                "note": "quota ceilings come from config/sources.yaml — confirm them against "
+                        "the live pricing page (free tiers change; Brave killed theirs)"}
+    except Exception as e:  # noqa: BLE001 — this endpoint reports, never raises raw
+        return {"ok": False, "detail": credstore.redact(str(e)), "quota": qm.status(pid),
+                "pricing_url": cfg.get("pricing_url", "")}
+
+
+class FreeTierIn(BaseModel):
+    free_tier_only: bool
+
+
+@app.patch("/research-sources/config")
+def research_sources_config(body: FreeTierIn) -> dict:
+    set_free_tier_only(body.free_tier_only)
+    return {"free_tier_only": body.free_tier_only,
+            "warning": None if body.free_tier_only else
+            "Disabling this permits billable calls. Brave-style overage billing has no spend cap."}
+
+
+@app.post("/forecast")
+def forecast() -> dict:
+    """Pre-run quota forecast: estimated calls per provider vs remaining free quota."""
+    research_cfg = load_yaml(str(CONFIG_DIR / "research.yaml"))
+    qm = QuotaManager()
+    rows = qm.forecast(research_cfg)
+    flags = [r["provider"] for r in rows if r["would_exceed"]]
+    b = research_cfg.get("budget") or {}
+    return {"providers": rows, "would_exceed": flags,
+            "free_tier_only": qm.free_tier_only,
+            "suggestion": (f"reduce scope: max_rounds ({b.get('max_rounds')}) or "
+                           f"max_queries_per_round in config/research.yaml, or rely on the "
+                           "keyless primaries" if flags else None),
+            "note": "upper bounds before dedup + cache; cached repeats consume zero quota"}
+
+
+@app.get("/runs/{run_id}/source-usage")
+def source_usage(run_id: str) -> dict:
+    case = _load_case(run_id)
+    events = read_events(RUNS_DIR / run_id)
+    findings = [{"url": f.source.url} for f in case.findings]
+    return usage_summary(events, findings)
+
+
+@app.post("/runs/{run_id}/source-retry")
+def source_retry(run_id: str, body: SourceRetryIn) -> dict:
+    """One-click retry of a failed source call, optionally forcing a provider.
+    The result lands in the cross-run cache, so the agent's next attempt is free."""
+    _load_case(run_id)
+    if not body.query and not body.url:
+        raise HTTPException(422, "give a query (search) or a url (read)")
+    ctx = RunContext.create(run_dir=RUNS_DIR / run_id, interactive=False)
+    ctx.events = EventLog(RUNS_DIR / run_id)
+    router = RouterSession(ctx)
+    try:
+        if body.url:
+            text = router.read(body.worker, body.url, force_provider=body.force_provider)
+            return {"ok": bool(text), "chars": len(text),
+                    "cached": bool(text), "note": "cached for the agent's next attempt"}
+        results = router.search(body.worker, body.query, force_provider=body.force_provider)
+        return {"ok": bool(results), "results": results[:10]}
+    finally:
+        router.release()
+
+
 # ── misc ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
