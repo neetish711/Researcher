@@ -364,13 +364,16 @@ _TYPE_URLS = {"anthropic": "https://api.anthropic.com", "openai": "https://api.o
 
 @app.get("/providers")
 def providers_list() -> list:
-    out = credstore.list_providers()
+    out = [dict(p, has_key=True) for p in credstore.list_providers()]
     vault_names = {p["name"] for p in out}
     for name, pcfg in (llm_config().get("providers") or {}).items():
         if name not in vault_names:
+            env_var = pcfg.get("api_key_env", "")
+            has_key = bool(os.environ.get(env_var or "", ""))
             out.append({"name": name, "type": "env (config/llm.yaml)",
                         "base_url": pcfg.get("base_url", ""),
-                        "key_fingerprint": f"env:{pcfg.get('api_key_env', '')}"})
+                        "has_key": has_key,
+                        "key_fingerprint": f"env:{env_var}" + ("" if has_key else " (NOT SET)")})
     return out
 
 

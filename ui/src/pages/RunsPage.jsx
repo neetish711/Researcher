@@ -16,7 +16,12 @@ function ModelPicker({ providers, value, onChange, listId }) {
     if (!provider) return
     api(`/providers/${provider}/models`)
       .then(d => { if (!dead) { setModels(d.models); setNote(`${d.models.length} models from this key`) } })
-      .catch(e => { if (!dead) setNote(`no model list (${e.message.slice(0, 80)}) — type a model id`) })
+      .catch(e => {
+        if (dead) return
+        setNote(/no api key/i.test(e.message)
+          ? `provider "${provider}" has no API key — add one under Settings → Providers`
+          : `no model list (${e.message.slice(0, 80)}) — type a model id`)
+      })
     return () => { dead = true }
   }, [provider])
 
@@ -129,9 +134,19 @@ export default function RunsPage() {
   return (
     <div className="grid lg:grid-cols-[460px_1fr] gap-4">
       <Card title="New idea">
-        {provList.length === 0 && (
-          <p className="text-amber-400 text-sm mb-3">No providers configured — add an API key under
-            <a className="underline ml-1" href="#/settings/providers">Settings → Providers</a> first.</p>)}
+        {!provList.some(p => p.has_key) && (
+          <div className="border border-amber-600 bg-amber-950/40 rounded-lg p-3 mb-4 text-sm">
+            <p className="font-bold text-amber-300">⚠ Nothing can run yet — no LLM API key is configured.</p>
+            <ol className="list-decimal pl-5 text-zinc-300 mt-1 space-y-0.5">
+              <li><a className="text-sky-400 underline" href="#/settings/providers">Add a provider key</a> (Anthropic,
+                OpenAI, or any compatible endpoint) and press <b>Test connection</b>.</li>
+              <li>Come back here — the model dropdown fills from your key.</li>
+              <li>Describe your idea and press Start run.</li>
+            </ol>
+            <p className="text-[11px] text-zinc-500 mt-1.5">Hosting on Vercel? Also set <code>CRED_SECRET</code> (and
+              optionally <code>LLM_API_KEY</code>) in the project env — the serverless disk is wiped on recycle,
+              so vault-only keys can vanish without it.</p>
+          </div>)}
         <Field label="Idea title"><Input value={title} onChange={e => setTitle(e.target.value)}
           placeholder="e.g. Automate invoice triage" /></Field>
         {INTAKE_FIELDS.map(([key, label, hint]) => (
@@ -143,23 +158,24 @@ export default function RunsPage() {
         <p className="text-[11px] text-zinc-600 mt-1">Anything you leave blank, the discovery agent will
           ask about — you answer its questions right in the run view.</p>
 
+        <div className="flex items-center justify-between mt-3">
+          <Label>Model <span className="text-zinc-600">(required — from your key; nothing is pinned)</span></Label>
+          <button className="text-xs text-sky-500 hover:underline" onClick={() => setPerRole(!perRole)}>
+            {perRole ? 'simple: one model' : 'per-role models'}</button>
+        </div>
+        <div className="space-y-2">
+          {rolesToShow.map(role => (
+            <div key={role}>
+              {perRole && <p className="text-[11px] text-zinc-500 mb-0.5">{role}
+                <span className="text-zinc-700 ml-2">default temp {defaults[role]?.temperature ?? '—'}</span></p>}
+              <ModelPicker providers={provList} listId={`models-${role}`}
+                           value={roleCfg[role] || {}} onChange={v => setRoleCfg({ ...roleCfg, [role]: v })} />
+            </div>
+          ))}
+        </div>
+
         <details className="mt-3">
-          <summary className="text-xs text-sky-500 cursor-pointer">Advanced: models, sources, budget</summary>
-          <div className="flex items-center justify-between mt-3">
-            <Label>Models <span className="text-zinc-600">(from your validated keys — nothing is pinned)</span></Label>
-            <button className="text-xs text-sky-500 hover:underline" onClick={() => setPerRole(!perRole)}>
-              {perRole ? 'simple: one model' : 'per-role models'}</button>
-          </div>
-          <div className="space-y-2">
-            {rolesToShow.map(role => (
-              <div key={role}>
-                {perRole && <p className="text-[11px] text-zinc-500 mb-0.5">{role}
-                  <span className="text-zinc-700 ml-2">default temp {defaults[role]?.temperature ?? '—'}</span></p>}
-                <ModelPicker providers={provList} listId={`models-${role}`}
-                             value={roleCfg[role] || {}} onChange={v => setRoleCfg({ ...roleCfg, [role]: v })} />
-              </div>
-            ))}
-          </div>
+          <summary className="text-xs text-sky-500 cursor-pointer">Advanced: sources, budget</summary>
           <Field label="Research budget" hint="wall clock, e.g. 30m / 4h (caps also in research.yaml)">
             <Input value={budget} onChange={e => setBudget(e.target.value)} placeholder="4h" />
           </Field>
@@ -178,8 +194,6 @@ export default function RunsPage() {
             })}
           </div>
         </details>
-        {!perRole && !(roleCfg.lead || {}).model && provList.length > 0 &&
-          <p className="text-[11px] text-amber-400 mt-2">Pick a model under Advanced before starting.</p>}
 
         <div className="flex gap-2 mt-4">
           <Btn variant="primary" disabled={busy || !(intake.problem || '').trim()} onClick={start}>Start run</Btn>

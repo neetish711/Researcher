@@ -117,7 +117,9 @@ export function useAsync() {
   const [err, setErr] = useState(null)
   const wrap = async (fn) => {
     setBusy(true); setErr(null)
-    try { return await fn() } catch (e) { setErr(e.message); throw e } finally { setBusy(false) }
+    // errors surface via setErr — never rethrown (callers don't catch; an
+    // unhandled rejection would just be console noise)
+    try { return await fn() } catch (e) { setErr(e.message); return null } finally { setBusy(false) }
   }
   return { busy, err, setErr, wrap }
 }
