@@ -4,8 +4,21 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>O2S Operator Console</title>
-    <script type="module" crossorigin src="/assets/index-Bh-zmfAn.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CsiEfAh1.css">
+    <script>
+      // self-heal: if a cached shell points at a bundle this deploy no longer
+      // has, force one cache-busting reload instead of showing a blank page
+      window.addEventListener('error', function (e) {
+        var t = e.target || {};
+        if ((t.tagName === 'SCRIPT' || t.tagName === 'LINK') &&
+            String(t.src || t.href).indexOf('/assets/') !== -1 &&
+            !sessionStorage.getItem('o2s_reloaded')) {
+          sessionStorage.setItem('o2s_reloaded', '1');
+          location.replace(location.pathname + '?bust=' + Date.now() + location.hash);
+        }
+      }, true);
+    </script>
+    <script type="module" crossorigin src="/assets/index-BuUqWNj7.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-vTtz5mXB.css">
   </head>
   <body>
     <div id="root"></div>

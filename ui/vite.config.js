@@ -4,6 +4,11 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  build: {
+    // keep previous hashed bundles: a user with a cached HTML shell must still
+    // load the bundle it names after we deploy (prune dist/assets occasionally)
+    emptyOutDir: false,
+  },
   server: {
     proxy: {
       // vite dev server → FastAPI on :8000
