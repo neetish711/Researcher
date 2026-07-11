@@ -991,13 +991,17 @@ def research_sources() -> dict:
             (f"env:{pc.get('key_env')}" if os.environ.get(pc.get("key_env", "") or "") else "")
         if not has_key and not pc.get("keyless_ok"):
             status = "no_key"
+        elif st.get("last_test_ok") is False:
+            status = "invalid"          # last Test connection failed — key present but bad
         elif st["remaining"] is not None and st["remaining"] <= 0:
             status = "exhausted"
         elif (st["remaining"] is not None and st["monthly_quota"]
               and st["remaining"] < 0.15 * st["monthly_quota"]):
             status = "quota_low"
+        elif st.get("last_test_ok") is True:
+            status = "connected"        # verified by a real call
         else:
-            status = "connected" if has_key or pc.get("keyless_ok") else "no_key"
+            status = "untested"         # key present, never tested
         cards.append({"id": pid, "name": pc.get("name", pid), "role": pc.get("role", ""),
                       "key_env": pc.get("key_env", ""), "pricing_url": pc.get("pricing_url", ""),
                       "reliability": pc.get("reliability", "secondary"),
@@ -1066,6 +1070,7 @@ def research_source_test(pid: str) -> dict:
                 "note": "quota ceilings come from config/sources.yaml — confirm them against "
                         "the live pricing page (free tiers change; Brave killed theirs)"}
     except Exception as e:  # noqa: BLE001 — this endpoint reports, never raises raw
+        qm.mark_test_failed(pid, str(e)[:200])
         return {"ok": False, "detail": credstore.redact(str(e)), "quota": qm.status(pid),
                 "pricing_url": cfg.get("pricing_url", "")}
 

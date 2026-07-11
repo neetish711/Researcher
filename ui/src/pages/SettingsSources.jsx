@@ -4,10 +4,11 @@ import { Btn, Card, ErrorNote, Field, Input, Json, Modal, Pill, Select, useAsync
 
 const TIERS = ['primary', 'secondary', 'vendor', 'community']
 const STATUS_UI = {
-  connected: ['✅ connected', 'text-emerald-400'],
+  connected: ['✅ connected (test passed)', 'text-emerald-400'],
+  untested: ['◍ key saved — press Test connection', 'text-sky-400'],
   quota_low: ['⚠️ quota low', 'text-amber-400'],
   exhausted: ['⛔ quota exhausted', 'text-red-400'],
-  invalid: ['❌ invalid key', 'text-red-400'],
+  invalid: ['❌ key invalid (last test failed)', 'text-red-400'],
   no_key: ['○ no key', 'text-zinc-500'],
 }
 
@@ -43,8 +44,10 @@ function ProviderCard({ p, onTest }) {
         <b className="text-zinc-100">{p.name}</b>
         <span className={`text-xs font-semibold ${cls}`}>{status}</span>
         <Pill kind="pending">{p.reliability}</Pill>
-        {p.allowed_endpoints && <span className="text-[10px] text-red-400 border border-red-900 rounded px-1.5 py-0.5">
-          only: {p.allowed_endpoints.join(',')} — /research BLOCKED</span>}
+        {p.allowed_endpoints && <span
+          title={`Cost guard, not an error: only the cheap ${p.allowed_endpoints.join('/')} endpoint (depth=basic, 1 credit) is enabled. Tavily's /research endpoint can burn ~250 credits in a single call, so it is disabled by policy.`}
+          className="text-[10px] text-emerald-300 border border-emerald-800 bg-emerald-950/40 rounded px-1.5 py-0.5 cursor-help">
+          🛡 cost guard: {p.allowed_endpoints.join('/')} only <span className="text-zinc-500">(hover — this protects your free tier)</span></span>}
         <a href={p.pricing_url} target="_blank" rel="noreferrer"
            className="ml-auto text-[11px] text-sky-500 hover:underline">verify limits on pricing page ↗</a>
       </div>

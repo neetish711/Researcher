@@ -99,6 +99,10 @@ class QuotaManager:
             provider TEXT PRIMARY KEY, used REAL NOT NULL DEFAULT 0,
             reset_date TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0,
             verified_note TEXT DEFAULT '')""")
+        try:  # migration: remember the last Test-connection outcome (NULL = never tested)
+            self._db.execute("ALTER TABLE ledger ADD COLUMN last_test_ok INTEGER")
+        except sqlite3.OperationalError:
+            pass
         self._db.execute("""CREATE TABLE IF NOT EXISTS reservations(
             run_id TEXT NOT NULL, provider TEXT NOT NULL, units REAL NOT NULL,
             PRIMARY KEY (run_id, provider))""")
@@ -153,16 +157,27 @@ class QuotaManager:
         quota = self.quota_of(provider)
         pc = self.provider_cfg(provider)
         remaining = None if quota is None else max(0.0, quota - used)
+        with self._lock:
+            row = self._db.execute("SELECT last_test_ok FROM ledger WHERE provider=?",
+                                   (provider,)).fetchone()
+        last_test = None if not row or row[0] is None else bool(row[0])
         return {"provider": provider, "unit": pc.get("unit", "call"), "used": round(used, 1),
                 "monthly_quota": quota, "remaining": None if remaining is None else round(remaining, 1),
                 "resets_on": reset_date, "quota_verified": bool(verified),
-                "verified_note": note,
+                "verified_note": note, "last_test_ok": last_test,
                 "assumed": pc.get("monthly_quota") is None and bool(pc)}
 
     def mark_verified(self, provider: str, note: str = "") -> None:
         self._row(provider)
         with self._lock:
-            self._db.execute("UPDATE ledger SET verified=1, verified_note=? WHERE provider=?",
+            self._db.execute("UPDATE ledger SET verified=1, verified_note=?, last_test_ok=1 "
+                             "WHERE provider=?", (note[:200], provider))
+            self._db.commit()
+
+    def mark_test_failed(self, provider: str, note: str = "") -> None:
+        self._row(provider)
+        with self._lock:
+            self._db.execute("UPDATE ledger SET last_test_ok=0, verified_note=? WHERE provider=?",
                              (note[:200], provider))
             self._db.commit()
 
