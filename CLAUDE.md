@@ -24,8 +24,10 @@ uvicorn src.server.app:app --port 8000        # serves API + built UI from ui/di
 cd ui && npm install && npm run dev           # UI dev server (vite proxies API to :8000)
 cd ui && npm run build                        # REQUIRED before deploy — dist/ is committed
 
-# Checks (no pytest suite; verification = compile + TestClient smoke scripts)
+# Checks — BOTH must pass before ANY deploy. compileall alone once shipped a
+# runtime NameError; the smoke test drives the real run thread, compile can't.
 python -m compileall -q src api
+python tests/test_smoke.py
 
 # Deploy (Vercel project researcher1/research; entry api/index.py; Python 3.12 pinned)
 vercel --prod --yes
