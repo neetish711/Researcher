@@ -162,6 +162,9 @@ def _recover_interrupted_runs() -> None:
                                  impact="checkpointed state kept — resume continues from this agent")
         except Exception:
             continue
+
+
+def _flow_steps() -> list:
     return load_yaml(str(CONFIG_DIR / "flow.yaml")).get("flow") or []
 
 
