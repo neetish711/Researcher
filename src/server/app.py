@@ -139,7 +139,29 @@ AGENT_META = {
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def _flow_steps() -> list:
+@app.on_event("startup")
+def _recover_interrupted_runs() -> None:
+    """A host restart kills in-flight agent threads. Any run still marked
+    running:* at boot was interrupted — flip it to a resumable error state so
+    the console shows a Retry button instead of a run stuck 'running' forever."""
+    if not RUNS_DIR.exists():
+        return
+    for d in RUNS_DIR.iterdir():
+        try:
+            if not (d / "casefile.json").exists():
+                continue
+            case = CaseFile.load(d)
+            if case.status.startswith("running:"):
+                agent = case.status.split(":", 1)[1]
+                case.status = f"error: interrupted by a host restart while running {agent} — press Retry/resume"
+                case.next_agent = agent
+                case.save(d)
+                EventLog(d).emit("error", agent=agent,
+                                 error="host restarted mid-run (process exit)",
+                                 recovered=False,
+                                 impact="checkpointed state kept — resume continues from this agent")
+        except Exception:
+            continue
     return load_yaml(str(CONFIG_DIR / "flow.yaml")).get("flow") or []
 
 
