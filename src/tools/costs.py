@@ -15,6 +15,11 @@ class BudgetExceeded(RuntimeError):
     """Raised when the run would exceed its cost or wall-clock budget."""
 
 
+class StopRequested(RuntimeError):
+    """Raised at a checkpoint when the operator asked the run to stop (server writes
+    a stop.flag in the run dir). State is checkpointed; Resume continues from there."""
+
+
 class CostTracker:
     """Thread-safe (research workers run in parallel) accumulator of LLM spend.
 

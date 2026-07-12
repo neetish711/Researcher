@@ -4,6 +4,7 @@ export const STATUS_COLOR = {
   done: 'bg-emerald-600', ok: 'bg-emerald-600', complete: 'bg-emerald-600',
   running: 'bg-sky-600 animate-pulse', waiting: 'bg-amber-500', retrying: 'bg-amber-500',
   error: 'bg-red-600', paused: 'bg-red-500', rejected: 'bg-red-700', pending: 'bg-zinc-600',
+  stopped: 'bg-amber-600',
 }
 
 export function Pill({ kind, children }) {
@@ -15,6 +16,7 @@ export function statusKind(status = '') {
   if (status.startsWith('awaiting')) return 'waiting'
   if (status.startsWith('error')) return 'error'
   if (status.startsWith('rejected')) return 'rejected'
+  if (status.startsWith('stopped')) return 'stopped'
   if (status === 'paused_budget') return 'paused'
   if (status === 'complete') return 'complete'
   return 'pending'

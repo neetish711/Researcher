@@ -14,7 +14,7 @@ const EVENT_ICON = {
   finding_created: '📌', citation_verified: '✅', citation_rejected: '🚫', round_complete: '🔁',
   gate_waiting: '⏸', gate_approved: '👍', gate_rejected: '👎', error: '❌', retry: '↩',
   checkpoint_saved: '💾', agent_start: '▶', agent_end: '⏹', worker_start: '👷', worker_end: '🏁',
-  run_created: '✨', tool_call: '🔧',
+  run_created: '✨', tool_call: '🔧', stop_requested: '🛑', stopped: '🛑',
 }
 
 /** live per-provider quota burn during a run */
@@ -68,8 +68,9 @@ function agentStates(cf, status) {
   const st = Object.fromEntries(AGENTS.map(a => [a, done[a] ? 'done' : 'pending']))
   if (status.startsWith('running:')) st[status.split(':')[1]] = 'running'
   if (status.startsWith('awaiting_gate:')) { const o = GATE_OWNER[status.split(':')[1]]; if (o) st[o] = 'waiting' }
-  if ((status.startsWith('error') || status === 'paused_budget') && cf.next_agent && st[cf.next_agent] !== 'done')
-    st[cf.next_agent] = 'error'
+  if ((status.startsWith('error') || status.startsWith('stopped') || status === 'paused_budget')
+      && cf.next_agent && st[cf.next_agent] !== 'done')
+    st[cf.next_agent] = status.startsWith('stopped') ? 'stopped' : 'error'
   return st
 }
 
@@ -209,22 +210,28 @@ function EventDetail({ e, onClose, onRetry }) {
 function RetryModal({ runId, providers, onClose, onDone }) {
   const [model, setModel] = useState('')
   const [provider, setProvider] = useState('')
+  const [rounds, setRounds] = useState('')
   const { busy, err, wrap } = useAsync()
   const go = () => wrap(async () => {
     if (model && KEY_RE.test(model)) throw new Error(KEY_MSG)
-    await api(`/runs/${runId}/retry`, { method: 'POST', body: { model: model || null, provider: provider || null } })
+    await api(`/runs/${runId}/retry`, { method: 'POST', body: {
+      model: model || null, provider: provider || null,
+      max_rounds: rounds ? Number(rounds) : null } })
     onDone(); onClose()
   })
   return (
     <Modal title="Retry this step" onClose={onClose}>
       <p className="text-sm text-zinc-400 mb-3">The model is a per-call parameter — swap it and re-run just the failed step, or leave blank to retry as-is.</p>
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-3 gap-3">
         <div><p className="text-xs text-zinc-500 mb-1">Provider (optional)</p>
           <Select value={provider} onChange={e => setProvider(e.target.value)}>
             <option value="">(keep current)</option>
             {providers.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}</Select></div>
         <div><p className="text-xs text-zinc-500 mb-1">Different model (optional)</p>
           <Input value={model} onChange={e => setModel(e.target.value)} placeholder="model id" /></div>
+        <div><p className="text-xs text-zinc-500 mb-1">Max research rounds (optional)</p>
+          <Input type="number" min="1" max="12" value={rounds} onChange={e => setRounds(e.target.value)}
+                 placeholder="e.g. 2 — shorter loop" /></div>
       </div>
       <div className="mt-4 flex gap-2"><Btn variant="primary" disabled={busy} onClick={go}>Retry</Btn></div>
       <ErrorNote>{err}</ErrorNote>
@@ -303,6 +310,16 @@ export default function RunConsole({ runId }) {
   const types = [...new Set(events.map(e => e.type))].sort()
 
   const resume = () => wrap(() => api(`/runs/${runId}/resume`, { method: 'POST' }))
+  const stop = () => wrap(() => api(`/runs/${runId}/stop`, { method: 'POST' }))
+  const rerun = () => wrap(async () => {
+    const d = await api(`/runs/${runId}/rerun`, { method: 'POST', body: {} })
+    window.location.hash = `#/runs/${d.run_id}`
+  })
+  const del = () => wrap(async () => {
+    if (!window.confirm('Delete this run and ALL its files (reports, events, uploads)? This cannot be undone.')) return
+    await api(`/runs/${runId}`, { method: 'DELETE' })
+    window.location.hash = '#/runs'
+  })
 
   const rejectedFindings = events.filter(e => e.type === 'citation_rejected')
   const allOptions = Object.entries(cf.tool_landscape || {}).flatMap(([cat, os]) => os.map(o => ({ ...o, cat })))
@@ -315,9 +332,15 @@ export default function RunConsole({ runId }) {
         {cf.title && <span className="font-mono text-xs text-zinc-600">{runId}</span>}
         <Pill kind={statusKind(sm.status)}>{sm.status.slice(0, 60)}</Pill>
         <span className="text-xs text-zinc-500">{fmtUsd(sm.cost_spent_usd)} · {sm.llm_calls} calls</span>
-        {(sm.status.startsWith('error') || sm.status === 'paused_budget') && <>
-          <Btn variant="primary" onClick={resume}>Retry / resume</Btn>
+        {(sm.status.startsWith('error') || sm.status.startsWith('stopped') || sm.status === 'paused_budget') && <>
+          <Btn variant="primary" onClick={resume}>{sm.status.startsWith('stopped') ? 'Resume' : 'Retry / resume'}</Btn>
           <Btn onClick={() => setRetry(true)}>Retry with different model…</Btn></>}
+        {sm.status.startsWith('running') &&
+          <Btn onClick={stop} title="halts at the next checkpoint — everything found so far is kept">⏹ Stop</Btn>}
+        <span className="flex-1" />
+        <Btn onClick={rerun} title="clone this idea into a brand-new run">↻ Rerun as new</Btn>
+        <Btn variant="danger" className="!bg-transparent !border-red-900 !text-red-400 hover:!bg-red-950"
+             onClick={del}>Delete…</Btn>
       </div>
 
       <Card>
@@ -349,6 +372,13 @@ export default function RunConsole({ runId }) {
         <div className="border border-red-700 bg-red-950/30 rounded-lg p-4 text-sm">
           <p className="text-red-300 break-words">{sm.status}</p>
           {sm.suggested_fix && <p className="text-zinc-400 mt-1">class <b className="text-amber-400">{sm.error_class}</b> — {sm.suggested_fix}</p>}
+        </div>
+      )}
+      {sm.status.startsWith('stopped') && (
+        <div className="border border-amber-700 bg-amber-950/30 rounded-lg p-4 text-sm">
+          <p className="text-amber-300 break-words">{sm.status}</p>
+          <p className="text-zinc-400 mt-1">Everything found so far is kept. <b>Resume</b> continues from the same
+            agent, <b>Rerun as new</b> starts a fresh run with the same intake, <b>Delete</b> removes it entirely.</p>
         </div>
       )}
       <ErrorNote>{actErr}</ErrorNote>

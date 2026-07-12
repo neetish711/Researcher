@@ -86,6 +86,7 @@ export default function RunsPage() {
   const [title, setTitle] = useState('')
   const [intake, setIntake] = useState({})
   const [budget, setBudget] = useState('')
+  const [rounds, setRounds] = useState('')
   const [roleCfg, setRoleCfg] = useState(() => {
     // a model clicked on the Providers page pre-fills the run form
     try {
@@ -139,6 +140,7 @@ export default function RunsPage() {
       if (lead.temp) body.temperatures = Object.fromEntries(ROLES.map(r => [r, Number(lead.temp)]))
     }
     if (srcSel) body.sources = srcSel
+    if (rounds) body.max_rounds = Number(rounds)
     for (const m of [body.model, ...Object.values(body.models || {})])
       if (m && KEY_RE.test(m)) throw new Error(KEY_MSG)
     return body
@@ -147,6 +149,11 @@ export default function RunsPage() {
   const start = () => wrap(async () => {
     const d = await api('/runs', { method: 'POST', body: buildBody() })
     window.location.hash = `#/runs/${d.run_id}`
+  })
+
+  const delRun = (r) => wrap(async () => {
+    if (!window.confirm(`Delete "${r.title || r.run_id}" and all its files? This cannot be undone.`)) return
+    await api(`/runs/${r.run_id}`, { method: 'DELETE' })
   })
 
   const dryRun = () => wrap(async () => {
@@ -202,9 +209,13 @@ export default function RunsPage() {
         </div>
 
         <details className="mt-3">
-          <summary className="text-xs text-sky-500 cursor-pointer">Advanced: sources, budget</summary>
+          <summary className="text-xs text-sky-500 cursor-pointer">Advanced: sources, budget, rounds</summary>
           <Field label="Research budget" hint="wall clock, e.g. 30m / 4h (caps also in research.yaml)">
             <Input value={budget} onChange={e => setBudget(e.target.value)} placeholder="4h" />
+          </Field>
+          <Field label="Max research rounds" hint="decrease for a faster, cheaper loop (default 6 from research.yaml; a running run can also be stopped at any round)">
+            <Input type="number" min="1" max="12" value={rounds}
+                   onChange={e => setRounds(e.target.value)} placeholder="6" />
           </Field>
           <Label>Research sources for this run <span className="text-zinc-600">(quota-guarded; router picks per worker)</span></Label>
           <div className="flex flex-wrap gap-1.5">
@@ -248,6 +259,9 @@ export default function RunsPage() {
               {!r.decision && r.verdict && <span className="text-emerald-500 text-xs">{r.verdict}</span>}
               <span className="text-zinc-500 text-xs">{r.findings}f · {fmtUsd(r.cost_spent_usd)}</span>
               <span className="text-zinc-600 text-xs w-16 text-right">{ago(r.updated_at)}</span>
+              <button title={r.status.startsWith('running') ? 'stop the run first (open it → Stop)' : 'delete this run'}
+                onClick={e => { e.preventDefault(); e.stopPropagation(); delRun(r) }}
+                className="text-zinc-600 hover:text-red-400 text-sm px-1 shrink-0">✕</button>
             </a>
           ))}
         </div>

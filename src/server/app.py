@@ -30,13 +30,13 @@ for _stream in (sys.stdout, sys.stderr):
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from src.orchestrator.runner import call_agent, gate_satisfied
 from src.server import credstore, sources as source_registry
 from src.server.events import EventLog, classify_error, read_events, tail_events
 from src.state.casefile import CaseFile
-from src.tools.costs import BudgetExceeded, CostTracker
+from src.tools.costs import BudgetExceeded, CostTracker, StopRequested
 from src.tools.models import (CONFIG_DIR, PROMPTS_DIR, REPO_ROOT, RunContext,
                               list_models, llm_config, load_yaml, test_provider,
                               validate_model_id)
@@ -202,6 +202,8 @@ def _make_ctx(run_id: str, params: dict) -> RunContext:
                             role_temps=params.get("temperatures") or {})
     ctx.events = EventLog(run_dir)
     ctx.sources = params.get("sources")  # None = all enabled sources
+    if params.get("max_rounds"):         # operator shortened/extended the research loop
+        ctx.research_overrides = {"max_rounds": int(params["max_rounds"])}
     return ctx
 
 
@@ -240,6 +242,14 @@ def _advance(run_id: str) -> None:
     try:
         for step in steps[start_idx:]:
             name = step["agent"]
+            if (run_dir / "stop.flag").exists():   # operator pressed Stop between agents
+                (run_dir / "stop.flag").unlink(missing_ok=True)
+                case.next_agent = name
+                case.status = f"stopped: by operator before {name} — press Resume to continue"
+                case.save(run_dir)
+                events.emit("stopped", agent=name,
+                            impact="checkpointed state kept — Resume continues from this agent")
+                return
             case.next_agent = name
             case.status = f"running:{name}"
             case.save(run_dir)
@@ -267,6 +277,12 @@ def _advance(run_id: str) -> None:
         if case.suitability is not None:
             case.status = "complete"
             case.next_agent = None
+    except StopRequested as e:
+        (run_dir / "stop.flag").unlink(missing_ok=True)
+        case.status = f"stopped: {e}"
+        events.emit("stopped", agent=name,
+                    impact="checkpointed state kept — Resume continues from this agent")
+        print(f"[server] run {run_id} stopped by operator at {name}")
     except BudgetExceeded as e:
         case.status = "paused_budget"
         events.emit("error", agent=name, error=str(e), recovered=False,
@@ -326,6 +342,7 @@ class StartRun(BaseModel):
     temperatures: Optional[Dict[str, float]] = None   # per-role override
     budget: Optional[str] = None
     sources: Optional[List[str]] = None               # research source ids for this run
+    max_rounds: Optional[int] = Field(None, ge=1, le=12)  # shorten/extend Agent 3's loop
 
     @field_validator("model")
     @classmethod
@@ -358,6 +375,17 @@ class RetryIn(BaseModel):
     model: Optional[str] = None
     models: Optional[Dict[str, str]] = None
     provider: Optional[str] = None
+    max_rounds: Optional[int] = Field(None, ge=1, le=12)
+
+
+class RerunIn(BaseModel):
+    """All optional — anything set overrides the cloned run's params."""
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    models: Optional[Dict[str, str]] = None
+    budget: Optional[str] = None
+    sources: Optional[List[str]] = None
+    max_rounds: Optional[int] = Field(None, ge=1, le=12)
 
 
 class RejectIn(BaseModel):
@@ -738,8 +766,10 @@ def record_outcome(run_id: str, body: OutcomeIn) -> dict:
 @app.post("/runs/{run_id}/resume")
 def resume(run_id: str) -> dict:
     case = _load_case(run_id)
-    if not (case.status == "paused_budget" or case.status.startswith(("error", "rejected"))):
+    if not (case.status == "paused_budget"
+            or case.status.startswith(("error", "rejected", "stopped"))):
         raise HTTPException(409, f"nothing to resume (status: {case.status})")
+    (RUNS_DIR / run_id / "stop.flag").unlink(missing_ok=True)
     _kick(run_id)
     return {"resumed_at_agent": case.next_agent, "status_url": f"/runs/{run_id}"}
 
@@ -749,7 +779,8 @@ def retry(run_id: str, body: RetryIn) -> dict:
     """Retry the failed/paused step — optionally with a different model (per role or
     run-wide), since the model is a per-call parameter."""
     case = _load_case(run_id)
-    if not (case.status == "paused_budget" or case.status.startswith(("error", "rejected", "awaiting"))):
+    if not (case.status == "paused_budget"
+            or case.status.startswith(("error", "rejected", "awaiting", "stopped"))):
         raise HTTPException(409, f"nothing to retry (status: {case.status})")
     for m in [body.model] + list((body.models or {}).values()):
         if m and credstore.looks_like_api_key(m):
@@ -761,7 +792,10 @@ def retry(run_id: str, body: RetryIn) -> dict:
         params["models"] = {**(params.get("models") or {}), **body.models}
     if body.provider:
         params["provider"] = body.provider
+    if body.max_rounds:
+        params["max_rounds"] = body.max_rounds
     _save_params(run_id, params)
+    (RUNS_DIR / run_id / "stop.flag").unlink(missing_ok=True)
     EventLog(RUNS_DIR / run_id).emit("retry", agent="human", step=case.next_agent,
                                      model=body.model or "", models=body.models or {},
                                      provider=body.provider or "")
@@ -770,6 +804,67 @@ def retry(run_id: str, body: RetryIn) -> dict:
                 "status_url": f"/runs/{run_id}"}
     _kick(run_id)
     return {"retrying": case.next_agent, "status_url": f"/runs/{run_id}"}
+
+
+@app.post("/runs/{run_id}/stop")
+def stop_run(run_id: str) -> dict:
+    """Cooperative stop: the run halts at the next checkpoint (agent boundary or
+    research round boundary) keeping everything found so far. Resume continues;
+    threads can't be killed mid-LLM-call safely, so this is the honest contract."""
+    _load_case(run_id)
+    t = _threads.get(run_id)
+    if not (t and t.is_alive()):
+        raise HTTPException(409, "run is not executing — nothing to stop "
+                                 "(use Delete to remove it, or Resume to continue it)")
+    (RUNS_DIR / run_id / "stop.flag").touch()
+    EventLog(RUNS_DIR / run_id).emit("stop_requested", agent="human",
+                                     impact="run pauses at the next checkpoint; findings so far are kept")
+    return {"stopping": True,
+            "note": "takes effect at the next agent/round checkpoint — a call already in flight finishes first"}
+
+
+@app.post("/runs/{run_id}/rerun", status_code=201)
+def rerun_run(run_id: str, body: Optional[RerunIn] = None) -> dict:
+    """Clone a run's intake into a brand-new run (fresh id, fresh state) —
+    optionally overriding model/provider/budget/rounds/sources for the new run."""
+    old = _load_case(run_id)
+    params = _load_params(run_id)
+    if body:
+        params.update(body.model_dump(exclude_none=True))
+    if not (params.get("problem") or "").strip():
+        raise HTTPException(409, "original run has no stored problem statement to rerun")
+    case = CaseFile(title=old.title)
+    run_dir = RUNS_DIR / case.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _save_params(case.run_id, params)
+    case.save(run_dir)
+    EventLog(run_dir).emit("run_created", agent="server", rerun_of=run_id,
+                           params={k: v for k, v in params.items() if k != "problem"})
+    _kick(case.run_id)
+    return {"run_id": case.run_id, "rerun_of": run_id, "status_url": f"/runs/{case.run_id}"}
+
+
+@app.delete("/runs/{run_id}")
+def delete_run(run_id: str) -> dict:
+    """Remove a run and all its artifacts (casefile, events, reports, uploads).
+    An executing run must be stopped first — its thread can't be killed safely."""
+    _load_case(run_id)
+    t = _threads.get(run_id)
+    if t and t.is_alive():
+        raise HTTPException(409, "run is executing — press Stop first, then delete "
+                                 "once it pauses at the next checkpoint")
+    import time
+    for attempt in range(4):  # Windows: a polling reader may briefly hold a file handle
+        try:
+            shutil.rmtree(RUNS_DIR / run_id)
+            break
+        except (PermissionError, OSError):
+            if attempt == 3:
+                raise HTTPException(503, "run files are briefly locked — retry the delete")
+            time.sleep(0.2 * (attempt + 1))
+    with _lock:
+        _threads.pop(run_id, None)
+    return {"deleted": run_id}
 
 
 # ── events / metrics ─────────────────────────────────────────────────────────

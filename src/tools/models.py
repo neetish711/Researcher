@@ -89,6 +89,7 @@ class RunContext:
     prior_llm_calls: int = 0
     events: Optional[object] = None        # EventLog (src/server/events.py) or None
     sources: Optional[List[str]] = None    # research source ids enabled for this run
+    research_overrides: Dict[str, object] = field(default_factory=dict)  # e.g. max_rounds per run
 
     @classmethod
     def create(cls, model: Optional[str] = None, provider: Optional[str] = None,

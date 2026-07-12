@@ -23,7 +23,7 @@ from src.agents._common import (build_parser, checkpoint_and_exit, context_from_
                                 gate, load_or_new, save_and_report)
 from src.state.casefile import (CaseFile, CostEstimate, Finding, ResearchPlan,
                                 SimilarityResult, Source, ToolOption)
-from src.tools.costs import BudgetExceeded, Deadline
+from src.tools.costs import BudgetExceeded, Deadline, StopRequested
 from src.tools.models import (CONFIG_DIR, RunContext, llm_json, load_prompt, load_yaml)
 from src.tools.reports import render_html, render_one_pager, render_ppt
 from src.tools.search import check_url, is_denied, rate_reliability
@@ -486,8 +486,10 @@ def run(case: CaseFile, ctx: RunContext, budget: Optional[str] = None) -> CaseFi
             return case
     plan = case.research_plan
 
-    max_rounds = int(bcfg.get("max_rounds", 6))
-    min_rounds = int(bcfg.get("min_rounds", 2))
+    # per-run override (server run form / retry) wins over research.yaml
+    overrides = getattr(ctx, "research_overrides", None) or {}
+    max_rounds = int(overrides.get("max_rounds") or bcfg.get("max_rounds", 6))
+    min_rounds = min(int(bcfg.get("min_rounds", 2)), max_rounds)
     max_workers = int(bcfg.get("max_workers", 4))
     gaps: List[str] = []
 
@@ -524,6 +526,10 @@ def _research_loop(case: CaseFile, ctx: RunContext, cfg: dict, plan: ResearchPla
                    min_rounds: int, max_workers: int, categories: Dict[str, str]) -> None:
     while case.research_rounds_done < max_rounds:
         deadline.check()
+        if (ctx.run_dir / "stop.flag").exists():   # operator pressed Stop
+            raise StopRequested(
+                f"by operator after round {case.research_rounds_done} — "
+                f"{len(case.findings)} findings kept; Resume continues from here")
         rnd = case.research_rounds_done + 1
         print(f"\n[research] round {rnd}/{max_rounds} "
               f"(wall clock left: {deadline.remaining():.0f}s, "

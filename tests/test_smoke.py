@@ -57,6 +57,40 @@ def test_core_endpoints_respond():
     assert c.get("/providers").json()
 
 
+def test_run_lifecycle_controls():
+    """The operator must be able to rerun a run, tune the research loop, and
+    delete runs — the controls added after 'I cannot delete or rerun a run'."""
+    c = TestClient(app)
+    # rounds override validated at the API edge
+    r = c.post("/runs", json={"problem": "x", "model": "m", "max_rounds": 99})
+    assert r.status_code == 422, "max_rounds must be capped (1-12)"
+    rid = c.post("/runs", json={"problem": "lifecycle smoke", "model": "smoke-model",
+                                "max_rounds": 2}).json()["run_id"]
+    _settle(c, rid)
+    # stop only applies to an executing run
+    assert c.post(f"/runs/{rid}/stop").status_code == 409
+    # rerun clones intake into a fresh run (optionally overriding the loop)
+    r = c.post(f"/runs/{rid}/rerun", json={"max_rounds": 1})
+    assert r.status_code == 201
+    rid2 = r.json()["run_id"]
+    assert rid2 != rid and r.json()["rerun_of"] == rid
+    _settle(c, rid2)
+    # delete removes the run entirely; a second delete 404s
+    assert c.delete(f"/runs/{rid}").json()["deleted"] == rid
+    assert c.get(f"/runs/{rid}").status_code == 404
+    assert c.delete(f"/runs/{rid}").status_code == 404
+    assert c.delete(f"/runs/{rid2}").status_code == 200
+
+
+def _settle(c, rid: str) -> str:
+    for _ in range(60):
+        status = c.get(f"/runs/{rid}").json()["summary"]["status"]
+        if status.startswith(("error", "awaiting", "stopped", "complete")):
+            return status
+        time.sleep(0.5)
+    raise AssertionError(f"run {rid} never settled")
+
+
 def test_security_invariants():
     c = TestClient(app)
     r = c.post("/providers", json={"name": "smoke-prov", "type": "anthropic",
