@@ -75,6 +75,10 @@ def sync_vault_durable() -> Dict:
     project = os.environ.get("VERCEL_PROJECT_ID", "")
     if not _STORE.exists():
         return {"durable": False, "reason": "vault is empty"}
+    if not os.environ.get("VERCEL"):
+        # always-on host (Railway volume, local disk): the vault file itself persists
+        return {"durable": True,
+                "reason": "stored on the server's persistent disk (survives restarts and redeploys)"}
     if not token or not project:
         missing = [n for n, v in (("VERCEL_TOKEN", token), ("VERCEL_PROJECT_ID", project)) if not v]
         return {"durable": False,
