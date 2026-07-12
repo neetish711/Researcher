@@ -51,8 +51,52 @@ def _fernet() -> Fernet:
 
 def _load() -> Dict:
     if not _STORE.exists():
+        # serverless boot: /tmp starts empty — rehydrate the vault from the O2S_VAULT
+        # env var (the whole encrypted vault file, pushed there by sync_vault_durable).
+        # Contents stay Fernet-encrypted; CRED_SECRET makes them decryptable anywhere.
+        blob = os.environ.get("O2S_VAULT", "")
+        if blob:
+            try:
+                data = json.loads(blob)
+                _save(data)
+                return data
+            except (json.JSONDecodeError, OSError):
+                pass
         return {"providers": {}, "source_secrets": {}}
     return json.loads(_STORE.read_text(encoding="utf-8"))
+
+
+def sync_vault_durable() -> Dict:
+    """Push the encrypted vault file into the Vercel project env (O2S_VAULT) so
+    UI-saved keys survive instance recycling and redeploys. Requires VERCEL_TOKEN
+    (create at vercel.com/account/tokens) and VERCEL_PROJECT_ID in the env.
+    Running instances keep their copy; every future boot rehydrates from the env."""
+    token = os.environ.get("VERCEL_TOKEN", "")
+    project = os.environ.get("VERCEL_PROJECT_ID", "")
+    if not _STORE.exists():
+        return {"durable": False, "reason": "vault is empty"}
+    if not token or not project:
+        missing = [n for n, v in (("VERCEL_TOKEN", token), ("VERCEL_PROJECT_ID", project)) if not v]
+        return {"durable": False,
+                "reason": f"set {' + '.join(missing)} in the Vercel project env to persist "
+                          "UI-saved keys across redeploys (token: vercel.com/account/tokens); "
+                          "until then this key lives only on the current instance"}
+    import requests
+    blob = _STORE.read_text(encoding="utf-8")
+    try:
+        resp = requests.post(
+            f"https://api.vercel.com/v10/projects/{project}/env?upsert=true",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"key": "O2S_VAULT", "value": blob, "type": "encrypted",
+                  "target": ["production", "preview"]},
+            timeout=20)
+        if resp.status_code < 300:
+            os.environ["O2S_VAULT"] = blob  # current process sees the latest too
+            return {"durable": True, "reason": "vault synced to Vercel env (O2S_VAULT); "
+                                               "future boots rehydrate automatically"}
+        return {"durable": False, "reason": f"Vercel API HTTP {resp.status_code}: {resp.text[:150]}"}
+    except Exception as e:  # noqa: BLE001
+        return {"durable": False, "reason": f"Vercel API unreachable: {e}"}
 
 
 def _save(data: Dict) -> None:

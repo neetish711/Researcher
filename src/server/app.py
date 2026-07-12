@@ -397,9 +397,11 @@ def providers_save(body: ProviderIn) -> dict:
     if not base_url:
         raise HTTPException(422, "base_url is required for openai-compatible providers")
     try:
-        return credstore.save_provider(body.name, body.type, base_url, body.api_key)
+        saved = credstore.save_provider(body.name, body.type, base_url, body.api_key)
     except ValueError as e:
         raise HTTPException(422, str(e))
+    saved["persistence"] = credstore.sync_vault_durable()
+    return saved
 
 
 @app.delete("/providers/{name}")
@@ -1024,7 +1026,8 @@ def research_source_key(pid: str, body: KeyIn) -> dict:
     if not body.api_key.strip():
         raise HTTPException(422, "api_key must be non-empty")
     fp = credstore.save_source_secret(pid, body.api_key.strip())
-    return {"provider": pid, "key_fingerprint": fp}   # fingerprint only — never the key
+    return {"provider": pid, "key_fingerprint": fp,   # fingerprint only — never the key
+            "persistence": credstore.sync_vault_durable()}
 
 
 @app.delete("/research-sources/{pid}/key")

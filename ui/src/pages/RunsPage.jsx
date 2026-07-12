@@ -4,20 +4,28 @@ import { Btn, Card, ErrorNote, Field, Input, Json, Label, Modal, Pill, Select, s
 
 const ROLES = ['lead', 'worker', 'classify', 'report']
 
-/** provider → searchable model picker, populated from the key's list-models call */
+/** provider → model picker. Models auto-load from the key; picking is one click.
+    Providers WITH keys sort first and are the default — never the keyless env stub. */
 function ModelPicker({ providers, value, onChange, listId }) {
   const [models, setModels] = useState([])
   const [note, setNote] = useState('')
-  const provider = value.provider || providers[0]?.name || ''
+  const [manual, setManual] = useState(false)
+  const ordered = [...providers].sort((a, b) => (b.has_key ? 1 : 0) - (a.has_key ? 1 : 0))
+  const provider = value.provider || ordered[0]?.name || ''
 
   useEffect(() => {
     let dead = false
-    setModels([]); setNote('')
+    setModels([]); setNote('loading models from this key…')
     if (!provider) return
     api(`/providers/${provider}/models`)
-      .then(d => { if (!dead) { setModels(d.models); setNote(`${d.models.length} models from this key`) } })
+      .then(d => {
+        if (dead) return
+        setModels(d.models); setManual(d.models.length === 0)
+        setNote(d.models.length ? `${d.models.length} models — pick one` : 'no list endpoint — type a model id')
+      })
       .catch(e => {
         if (dead) return
+        setManual(true)
         setNote(/no api key/i.test(e.message)
           ? `provider "${provider}" has no API key — add one under Settings → Providers`
           : `no model list (${e.message.slice(0, 80)}) — type a model id`)
@@ -30,15 +38,26 @@ function ModelPicker({ providers, value, onChange, listId }) {
     <div className="flex gap-2 items-start">
       <div className="w-40 shrink-0">
         <Select value={provider} onChange={e => onChange({ ...value, provider: e.target.value, model: '' })}>
-          {providers.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}
+          {ordered.map(p => <option key={p.name} value={p.name}>
+            {p.name}{p.has_key ? '' : ' (no key)'}</option>)}
         </Select>
       </div>
       <div className="flex-1">
-        <Input list={listId} value={value.model || ''} placeholder={models.length ? 'search models…' : 'model id'}
-               onChange={e => onChange({ ...value, model: e.target.value })}
-               className={keyErr ? 'border-red-600' : ''} />
-        <datalist id={listId}>{models.map(m => <option key={m} value={m} />)}</datalist>
-        <p className={`text-[11px] mt-0.5 ${keyErr ? 'text-red-400' : 'text-zinc-600'}`}>{keyErr || note}</p>
+        {!manual && models.length > 0 ? (
+          <Select value={value.model || ''} onChange={e => onChange({ ...value, model: e.target.value })}>
+            <option value="" disabled>— click to pick a model —</option>
+            {models.map(m => <option key={m} value={m}>{m}</option>)}
+          </Select>
+        ) : (
+          <Input list={listId} value={value.model || ''} placeholder="model id"
+                 onChange={e => onChange({ ...value, model: e.target.value })}
+                 className={keyErr ? 'border-red-600' : ''} />
+        )}
+        <p className={`text-[11px] mt-0.5 ${keyErr ? 'text-red-400' : 'text-zinc-600'}`}>
+          {keyErr || note}
+          {!manual && models.length > 0 &&
+            <button className="ml-2 text-sky-600 hover:underline" onClick={() => setManual(true)}>type manually</button>}
+        </p>
       </div>
       <div className="w-20 shrink-0">
         <Input type="number" step="0.1" min="0" max="2" placeholder="temp"
@@ -67,7 +86,13 @@ export default function RunsPage() {
   const [title, setTitle] = useState('')
   const [intake, setIntake] = useState({})
   const [budget, setBudget] = useState('')
-  const [roleCfg, setRoleCfg] = useState({})       // {role: {provider, model, temp}}
+  const [roleCfg, setRoleCfg] = useState(() => {
+    // a model clicked on the Providers page pre-fills the run form
+    try {
+      const pref = JSON.parse(localStorage.getItem('preferred_model') || 'null')
+      return pref ? { lead: { provider: pref.provider, model: pref.model } } : {}
+    } catch { return {} }
+  })                                               // {role: {provider, model, temp}}
   const [perRole, setPerRole] = useState(false)
   const [srcSel, setSrcSel] = useState(null)       // null = all registered
   const [dry, setDry] = useState(null)
@@ -97,8 +122,10 @@ export default function RunsPage() {
     if (!problem.trim()) throw new Error('describe the problem first')
     const lead = roleCfg.lead || {}
     if (!lead.model && !perRole) throw new Error('pick a model (populated from your provider key)')
+    const usable = provList.filter(p => p.has_key)
     const body = { problem, title: title || intake.problem?.slice(0, 80) || '',
-                   budget: budget || null, provider: lead.provider || provList[0]?.name || null }
+                   budget: budget || null,
+                   provider: lead.provider || usable[0]?.name || provList[0]?.name || null }
     if (perRole) {
       body.models = {}; body.temperatures = {}
       for (const r of ROLES) {
